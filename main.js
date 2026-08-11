@@ -37,7 +37,7 @@
     if (audioContext) return;
 
     audioContext = new (window.AudioContext || window.webkitAudioContext)({
-      sampleRate: 8000,
+      sampleRate: 32000,
     });
 
     await audioContext.audioWorklet.addModule('dist/spc-worklet-bundle.js');
