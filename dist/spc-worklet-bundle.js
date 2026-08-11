@@ -1154,6 +1154,26 @@ class SPCEngine {
     // KON/KOFFはロード直後は発火させない(実機のIPLROM挙動を模倣する簡易対応)
     this.dsp.regs[0x4c] = 0;
 
+    // --- I/Oレジスタ内部状態の復元 ---
+    // RAMダンプ上の 0xF0-0xFF にはCONTROLやタイマーターゲット等の値が
+    // そのまま焼き込まれているが、cpu.ram.set()による直接コピーでは
+    // cpu.write()内で行われる特殊処理(timerTarget[]への反映、
+    // timerEnable[]の設定など)が一切実行されないため、
+    // CPU内部状態(timerEnable/timerTarget/timerCounter等)が
+    // 初期値のまま(target=0など)になってしまう。
+    // これを放置するとタイマーが本来より極端に高頻度で発火し、
+    // 曲のテンポが実機の何十倍にもなる重大な不具合につながるため、
+    // ロード直後に該当アドレスへ改めてcpu.write()経由で書き戻し、
+    // 内部状態を正しく同期させる。
+    const ioRegs = [0xfa, 0xfb, 0xfc, 0xf1]; // タイマーターゲット3つ + CONTROL
+    for (const addr of ioRegs) {
+      this.cpu.write(addr, parsed.ram[addr]);
+    }
+    // タイマーのカウンタ/出力は曲頭では0から始めるのが自然なため明示的にクリアする
+    this.cpu.timerCounter = [0, 0, 0];
+    this.cpu.timerOut = new Uint8Array(3);
+    this.cpu._tAccum = [0, 0, 0];
+
     this.loaded = true;
     this._cycleAccum = 0;
   }
@@ -1164,7 +1184,7 @@ class SPCEngine {
 
     let budget = CPU_CYCLES_PER_SAMPLE + this._cycleAccum;
     let guard = 0;
-    while (budget > 0) {
+    while (budget > 0 && guard < 64) {
       const used = this.cpu.step();
       budget -= used;
       guard++;
@@ -1188,7 +1208,17 @@ class SPCEngine {
 // SPCPlayerProcessor: AudioWorkletProcessor
 // メインスレッドからSPCデータを受け取り、SPCEngineでレンダリングして
 // Web Audioの出力バッファに書き込む。
+//
+// S-DSPは実機同様32000Hz固定でサンプルを生成するが、AudioContextの
+// 実際のサンプルレート(sampleRateグローバル変数、48000Hz等になることが多い)
+// はブラウザ/OS依存で指定通りにならない場合があるため、
+// ここで32000Hz -> 実際のサンプルレートへ線形補間リサンプリングを行う。
+// これを怠ると「サンプルレート指定が無視され、DSPの1サンプルがそのまま
+// 出力の1サンプルとして再生される」ため、再生速度が実機と異なってしまう
+// (例: 実際が48000Hzなのに32000Hz想定で詰めると 48000/32000=1.5倍速になる)。
 // ============================================================================
+
+const SDSP_SAMPLE_RATE = 32000;
 
 class SPCPlayerProcessor extends AudioWorkletProcessor {
   constructor() {
@@ -1196,12 +1226,27 @@ class SPCPlayerProcessor extends AudioWorkletProcessor {
     this.engine = new SPCEngine();
     this.playing = false;
 
+    // リサンプリング用の状態
+    // sampleRate は AudioWorkletGlobalScope が提供するグローバル変数で、
+    // このコンテキストの実際の出力サンプルレート(Hz)が入っている。
+    this.resampleRatio = SDSP_SAMPLE_RATE / sampleRate; // 1コンテキストサンプル進める毎に進めるDSPサンプル数
+    this.srcPos = 0;       // DSPサンプル列上の現在位置(小数)
+    this.prevL = 0;        // 直前に生成したDSPサンプル(補間の左端)
+    this.prevR = 0;
+    this.nextL = 0;        // 次に生成したDSPサンプル(補間の右端)
+    this.nextR = 0;
+    this.haveSample = false;
+
     this.port.onmessage = (event) => {
       const msg = event.data;
       if (msg.type === 'load') {
         try {
           this.engine.loadSPC(msg.parsed);
           this.playing = true;
+          // 新規ロード時にリサンプラーの状態もリセットする
+          this.srcPos = 0;
+          this.haveSample = false;
+          this.prevL = this.prevR = this.nextL = this.nextR = 0;
           this.port.postMessage({ type: 'loaded' });
         } catch (e) {
           this.port.postMessage({ type: 'error', message: String(e) });
@@ -1212,6 +1257,15 @@ class SPCPlayerProcessor extends AudioWorkletProcessor {
         this.playing = false;
       }
     };
+  }
+
+  // DSPを1サンプル分進めてprev/nextを更新する
+  _advanceDspSample() {
+    this.prevL = this.nextL;
+    this.prevR = this.nextR;
+    const [l, r] = this.engine.renderSample();
+    this.nextL = l;
+    this.nextR = r;
   }
 
   process(inputs, outputs) {
@@ -1226,11 +1280,24 @@ class SPCPlayerProcessor extends AudioWorkletProcessor {
       return true;
     }
 
-    // AudioWorkletの出力サンプルレートは通常48000Hz等だが、
-    // SDSPは32000Hz固定生成なので、ここでは単純に毎コールバックごとに
-    // n個分のサンプルを32000Hz相当としてそのまま埋める簡易実装とする。
-    // (ブラウザ側でAudioContextのsampleRateを32000で作成することを推奨)
-    this.engine.renderBlock(left, right, n);
+    if (!this.haveSample) {
+      // 最初の2点を用意する
+      this._advanceDspSample();
+      this._advanceDspSample();
+      this.haveSample = true;
+    }
+
+    for (let i = 0; i < n; i++) {
+      // srcPosが1.0を超えるたびにDSPサンプルを1つ進める
+      while (this.srcPos >= 1) {
+        this._advanceDspSample();
+        this.srcPos -= 1;
+      }
+      const frac = this.srcPos;
+      left[i] = this.prevL + (this.nextL - this.prevL) * frac;
+      right[i] = this.prevR + (this.nextR - this.prevR) * frac;
+      this.srcPos += this.resampleRatio;
+    }
 
     return true;
   }
