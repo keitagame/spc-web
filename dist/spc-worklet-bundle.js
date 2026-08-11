@@ -1164,7 +1164,7 @@ class SPCEngine {
 
     let budget = CPU_CYCLES_PER_SAMPLE + this._cycleAccum;
     let guard = 0;
-    while (budget > 0 && guard < 64) {
+    while (budget > 0) {
       const used = this.cpu.step();
       budget -= used;
       guard++;
