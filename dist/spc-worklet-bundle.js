@@ -201,16 +201,25 @@ class SPC700 {
   }
 
   _exec(op) {
+    console.log(
+        "SPC EXEC",
+        op.toString(16).padStart(2, "0"),
+        "PC=",
+        (this.PC - 1).toString(16).padStart(4, "0")
+    );
+
     const fn = this.opTable[op];
+
     if (!fn) {
-        throw new Error(
-            `Unimplemented SPC700 opcode $${op.toString(16).padStart(2, "0")} ` +
-            `at PC=$${((this.PC - 1) & 0xffff).toString(16).padStart(4, "0")}`
+        console.error(
+            "UNKNOWN OPCODE",
+            op.toString(16).padStart(2, "0")
         );
+        return 2;
     }
-    
+
     return fn.call(this);
-  }
+}
 
   _branch(cond, disp) {
     // dispは符号付き8bit
