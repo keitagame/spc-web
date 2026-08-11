@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>SPC Player - SFC音源プレイヤー</title>
+<title>SPC</title>
 <style>
  
 </style>
@@ -11,14 +11,11 @@
 <body>
 
 <div class="card">
-  <h1>SPC Player <span class="chip">SFC</span></h1>
-  <div class="subtitle">SFC(SNES)の音源データ(.spc)をブラウザだけで再生します</div>
-
+  <h1>SPC Web</h1>
+ 
   <div class="dropzone" id="dropzone">
     <input type="file" id="fileInput" accept=".spc" />
-    <div class="icon">🎵</div>
-    <div class="main">.spcファイルをドロップ、またはクリックして選択</div>
-    <div class="sub">SPC700 + DSP をJavaScriptでフルエミュレーション</div>
+   
   </div>
 
   <div class="track-info" id="trackInfo">
@@ -29,7 +26,7 @@
       <span id="trackDumper"></span>
     </div>
   </div>
-
+<div style="display:none">
   <div class="controls">
     <button class="play-btn" id="playBtn" disabled>▶ 再生</button>
   </div>
@@ -46,6 +43,7 @@
     ※ SPC700 CPUとS-DSPを独自にJavaScriptで実装した簡易エミュレータです。
     一部の特殊命令やエコー処理は近似実装のため、曲によっては音が実機と異なる場合があります。
   </div>
+</div>
 </div>
 
 <script src="spc-parser.js"></script>
