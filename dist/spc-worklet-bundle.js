@@ -203,9 +203,12 @@ class SPC700 {
   _exec(op) {
     const fn = this.opTable[op];
     if (!fn) {
-      // 未定義命令は NOP 相当として扱う（安全のため）
-      return 2;
+        throw new Error(
+            `Unimplemented SPC700 opcode $${op.toString(16).padStart(2, "0")} ` +
+            `at PC=$${((this.PC - 1) & 0xffff).toString(16).padStart(4, "0")}`
+        );
     }
+    
     return fn.call(this);
   }
 
