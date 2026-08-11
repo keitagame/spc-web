@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SPC Player - SFC音源プレイヤー</title>
+<style>
+  :root {
+    --bg: #14151a;
+    --panel: #1d1f27;
+    --accent: #7c9eff;
+    --accent2: #ff7ca0;
+    --text: #e8e9ef;
+    --text-dim: #9092a3;
+    --border: #2c2e3a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Hiragino Kaku Gothic ProN", "Yu Gothic", sans-serif;
+    background: radial-gradient(ellipse at top, #1a1c24 0%, #0e0f13 100%);
+    color: var(--text);
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+  }
+  .card {
+    width: 100%;
+    max-width: 480px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 32px;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.4);
+  }
+  h1 {
+    font-size: 20px;
+    margin: 0 0 4px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  h1 .chip {
+    font-size: 11px;
+    padding: 3px 8px;
+    border-radius: 20px;
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    color: #10111a;
+    font-weight: 700;
+    letter-spacing: 0.03em;
+  }
+  .subtitle {
+    color: var(--text-dim);
+    font-size: 13px;
+    margin-bottom: 28px;
+  }
+
+  .dropzone {
+    border: 2px dashed var(--border);
+    border-radius: 12px;
+    padding: 28px 16px;
+    text-align: center;
+    cursor: pointer;
+    transition: border-color 0.2s, background 0.2s;
+    position: relative;
+  }
+  .dropzone:hover, .dropzone.dragover {
+    border-color: var(--accent);
+    background: rgba(124, 158, 255, 0.06);
+  }
+  .dropzone input[type=file] {
+    position: absolute;
+    inset: 0;
+    opacity: 0;
+    cursor: pointer;
+  }
+  .dropzone .icon { font-size: 28px; margin-bottom: 8px; }
+  .dropzone .main { font-size: 14px; color: var(--text); }
+  .dropzone .sub { font-size: 12px; color: var(--text-dim); margin-top: 4px; }
+
+  .track-info {
+    margin-top: 24px;
+    padding: 16px;
+    background: rgba(255,255,255,0.03);
+    border-radius: 10px;
+    display: none;
+  }
+  .track-info.visible { display: block; }
+  .track-title { font-size: 16px; font-weight: 600; margin-bottom: 2px; word-break: break-all; }
+  .track-game { font-size: 13px; color: var(--text-dim); }
+  .track-meta { font-size: 12px; color: var(--text-dim); margin-top: 8px; display: flex; gap: 14px; flex-wrap: wrap; }
+
+  .controls {
+    margin-top: 20px;
+    display: flex;
+    gap: 12px;
+    align-items: center;
+  }
+  button.play-btn {
+    flex: 1;
+    padding: 14px;
+    border: none;
+    border-radius: 10px;
+    background: linear-gradient(135deg, var(--accent), #5a7ce0);
+    color: #0d0e14;
+    font-size: 15px;
+    font-weight: 700;
+    cursor: pointer;
+    transition: transform 0.1s, opacity 0.2s;
+  }
+  button.play-btn:hover { transform: translateY(-1px); }
+  button.play-btn:active { transform: translateY(0); }
+  button.play-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+    transform: none;
+  }
+  button.play-btn.playing {
+    background: linear-gradient(135deg, var(--accent2), #e05a80);
+  }
+
+  .status {
+    margin-top: 14px;
+    font-size: 12px;
+    color: var(--text-dim);
+    min-height: 16px;
+  }
+  .status.error { color: #ff6b81; }
+  .status.ok { color: #6bffa0; }
+
+  .volume-row {
+    margin-top: 16px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 12px;
+    color: var(--text-dim);
+  }
+  .volume-row input[type=range] {
+    flex: 1;
+    accent-color: var(--accent);
+  }
+
+  .footer-note {
+    margin-top: 24px;
+    font-size: 11px;
+    color: #565869;
+    line-height: 1.6;
+  }
+</style>
+</head>
+<body>
+
+<div class="card">
+  <h1>SPC Player <span class="chip">SFC</span></h1>
+  <div class="subtitle">SFC(SNES)の音源データ(.spc)をブラウザだけで再生します</div>
+
+  <div class="dropzone" id="dropzone">
+    <input type="file" id="fileInput" accept=".spc" />
+    <div class="icon">🎵</div>
+    <div class="main">.spcファイルをドロップ、またはクリックして選択</div>
+    <div class="sub">SPC700 + DSP をJavaScriptでフルエミュレーション</div>
+  </div>
+
+  <div class="track-info" id="trackInfo">
+    <div class="track-title" id="trackTitle">-</div>
+    <div class="track-game" id="trackGame"></div>
+    <div class="track-meta">
+      <span id="trackArtist"></span>
+      <span id="trackDumper"></span>
+    </div>
+  </div>
+
+  <div class="controls">
+    <button class="play-btn" id="playBtn" disabled>▶ 再生</button>
+  </div>
+
+  <div class="volume-row">
+    <span>🔊</span>
+    <input type="range" id="volumeSlider" min="0" max="100" value="70" />
+    <span id="volumeLabel">70%</span>
+  </div>
+
+  <div class="status" id="status">SPCファイルを選択してください</div>
+
+  <div class="footer-note">
+    ※ SPC700 CPUとS-DSPを独自にJavaScriptで実装した簡易エミュレータです。
+    一部の特殊命令やエコー処理は近似実装のため、曲によっては音が実機と異なる場合があります。
+  </div>
+</div>
+
+<script src="spc-parser.js"></script>
+<script src="main.js"></script>
+</body>
+</html>
