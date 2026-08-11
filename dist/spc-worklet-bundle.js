@@ -1095,8 +1095,9 @@ class DSP {
     }
 
     // マスターボリューム適用
-    const outL = (mixL * this.mvolL) / (128 * 2047);
-    const outR = (mixR * this.mvolR) / (128 * 2047);
+    const outL = (mixL * this.mvolL) / (128 * 8192);
+const outR = (mixR * this.mvolR) / (128 * 8192);
+
 
     return [
       Math.max(-1, Math.min(1, outL)),
