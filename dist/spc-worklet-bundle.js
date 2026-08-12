@@ -192,15 +192,6 @@ class SPC700 {
   // 1命令実行。実行したサイクル数を返す。
   // -------------------------------------------------------------------
   step() {
-    this.pcCount ??= new Map();
-
-    const pc = this.PC;
-    const count = (this.pcCount.get(pc) || 0) + 1;
-    this.pcCount.set(pc, count);
-
-    
-    const startPC = this.PC;
-    
     const op = this.fetch8();
     const cyc = this._exec(op);
     this.cycles += cyc;
@@ -714,7 +705,6 @@ class SPC700 {
     T[0x0A] = function () { const w=this.fetch16(); const addr=w&0x1fff; const bit=(w>>13)&7; const v=(rd(addr)>>bit)&1; this.flagC = this.flagC | v; return 5; };
     T[0x2A] = function () { const w=this.fetch16(); const addr=w&0x1fff; const bit=(w>>13)&7; const v=(rd(addr)>>bit)&1; this.flagC = this.flagC | (v^1); return 5; };
     T[0x8A] = function () { const w=this.fetch16(); const addr=w&0x1fff; const bit=(w>>13)&7; const v=(rd(addr)>>bit)&1; this.flagC = this.flagC ^ v; return 5; };
-    T[0xEA] = function () { const a=this.fetch8(); const bit=(this.ram[(this.PC-1)&0xffff]); return 5; }; // 未使用フォールバック(placeholder)
 
     // NOT1 mem.bit (直接ビット反転)
     T[0xEA] = function () { const w=this.fetch16(); const addr=w&0x1fff; const bit=(w>>13)&7; let v=rd(addr); v ^= (1<<bit); wr(addr, v&0xff); return 5; };
@@ -942,7 +932,6 @@ class DSP {
       const attackRate = (a1 & 0x0f) * 2 + 1;
       const decayRate = ((a1 >> 4) & 0x07) * 2 + 16;
       const sustainRate = a2 & 0x1f;
-      const sustainLevel = ((a2 >> 5) & 0x07 + 1);
       const sustainLvl = (((a2 >> 5) & 0x07) + 1) * 256;
 
       if (voice.envMode === 'attack') {
@@ -1166,8 +1155,6 @@ class SPCEngine {
 
     this.dsp.reset();
     this.dsp.regs.set(parsed.dspRegs);
-    // KON/KOFFはロード直後は発火させない(実機のIPLROM挙動を模倣する簡易対応)
-    this.dsp.regs[0x4c] = 0;
 
     // --- I/Oレジスタ内部状態の復元 ---
     // RAMダンプ上の 0xF0-0xFF にはCONTROLやタイマーターゲット等の値が
