@@ -201,13 +201,7 @@ class SPC700 {
   }
 
   _exec(op) {
-    console.log(
-        "SPC EXEC",
-        op.toString(16).padStart(2, "0"),
-        "PC=",
-        (this.PC - 1).toString(16).padStart(4, "0")
-    );
-
+   
     const fn = this.opTable[op];
 
     if (!fn) {
