@@ -192,7 +192,19 @@ class SPC700 {
   // 1命令実行。実行したサイクル数を返す。
   // -------------------------------------------------------------------
   step() {
+    this.pcCount ??= new Map();
+
+    const pc = this.PC;
+    const count = (this.pcCount.get(pc) || 0) + 1;
+    this.pcCount.set(pc, count);
+
+    if (count === 100000) {
+        console.warn(
+            `Possible infinite loop: PC=$${pc.toString(16).padStart(4, "0")}`
+        );
+    }
     const startPC = this.PC;
+    
     const op = this.fetch8();
     const cyc = this._exec(op);
     this.cycles += cyc;
