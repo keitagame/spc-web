@@ -36,9 +36,7 @@
   async function ensureAudioContext() {
     if (audioContext) return;
 
-    audioContext = new (window.AudioContext || window.webkitAudioContext)({
-      sampleRate: 32000,
-    });
+    audioContext = new (window.AudioContext || window.webkitAudioContext);
 
     await audioContext.audioWorklet.addModule('dist/spc-worklet-bundle.js');
 
