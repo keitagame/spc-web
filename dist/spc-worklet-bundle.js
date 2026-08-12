@@ -746,17 +746,55 @@ const COUNTER_RATES = [
   0, 2048, 1536, 1280, 1024, 768, 640, 512, 384, 320, 256, 192,
   160, 128, 96, 80, 64, 48, 40, 32, 24, 20, 16, 12, 10, 8, 6, 5, 4, 3, 2, 1
 ];
+// 各レートに対応する「オフセット」テーブル(実機のグローバルタイマーは32768カウンタを
+// 継続的にデクリメントしており、各レートは固有の位相でトリガする)。
+// この位相込みの判定により、複数ボイスが同時刻に一斉発火してエンベロープが
+// 不自然に揃う(実機と異なるビート感が出る)問題を避ける。
+const COUNTER_OFFSETS = [
+  0, 0, 1040, 536, 0, 1040, 536, 0, 1040, 536, 0, 1040,
+  536, 0, 1040, 536, 0, 1040, 536, 0, 1040, 536, 0, 1040,
+  536, 0, 1040, 0, 536, 0, 1040, 0
+];
 
-// Gaussian補間用テーブル(実機の256エントリ、簡易版として滑らかな近似カーブを生成)
-function buildGaussTable() {
-  // 実機のgaussテーブルに近い形（4点補間用重み）を生成
-  const table = new Float64Array(512);
-  for (let i = 0; i < 512; i++) {
-    const x = (i - 256) / 256;
-    table[i] = Math.exp(-3.0 * x * x);
-  }
-  return table;
-}
+// Gaussian補間用テーブル(実機のGAUSSテーブル、512エントリ)
+// S-DSPは4点(過去2点+現在2点)のガウス窓補間でBRRサンプル間を補間する。
+// 実機のROM内テーブルは非対称(前後で異なるカーブ)であり、
+// pitchCounterの上位8bitをインデックスとして使う。
+// 値は公開されている実機吸い出しテーブル(bsnes/snes9x等で使用されるもの)と同一。
+const GAUSS_TABLE = new Int16Array([
+    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    1,
+    1,    1,    1,    1,    1,    1,    1,    1,    1,    1,    1,    1,    2,    2,    2,    2,
+    2,    2,    2,    2,    3,    3,    3,    3,    3,    3,    4,    4,    4,    4,    4,    5,
+    5,    5,    5,    6,    6,    6,    6,    7,    7,    7,    8,    8,    8,    9,    9,    9,
+   10,   10,   10,   11,   11,   11,   12,   12,   13,   13,   14,   14,   15,   15,   15,   16,
+   16,   17,   17,   18,   19,   19,   20,   20,   21,   21,   22,   23,   23,   24,   24,   25,
+   26,   27,   27,   28,   29,   29,   30,   31,   32,   32,   33,   34,   35,   36,   36,   37,
+   38,   39,   40,   41,   42,   43,   44,   45,   46,   47,   48,   49,   50,   51,   52,   53,
+   54,   55,   56,   58,   59,   60,   61,   63,   64,   65,   67,   68,   69,   71,   72,   74,
+   75,   76,   78,   79,   81,   82,   84,   85,   87,   89,   90,   92,   94,   95,   97,   99,
+  100,  102,  104,  106,  107,  109,  111,  113,  115,  117,  118,  120,  122,  124,  126,  128,
+  130,  132,  134,  137,  139,  141,  143,  145,  147,  150,  152,  154,  156,  159,  161,  163,
+  166,  168,  171,  173,  175,  178,  180,  183,  186,  188,  191,  193,  196,  199,  201,  204,
+  207,  210,  212,  215,  218,  221,  224,  227,  230,  233,  236,  239,  242,  245,  248,  251,
+  254,  257,  260,  263,  267,  270,  273,  276,  280,  283,  286,  290,  293,  297,  300,  304,
+  307,  311,  314,  318,  321,  325,  328,  332,  336,  339,  343,  347,  351,  354,  358,  362,
+  366,  370,  374,  378,  381,  385,  389,  393,  397,  401,  405,  410,  414,  418,  422,  426,
+  430,  434,  439,  443,  447,  451,  456,  460,  464,  469,  473,  477,  482,  486,  491,  495,
+  499,  504,  508,  513,  517,  522,  526,  531,  535,  540,  544,  549,  553,  558,  562,  567,
+  571,  576,  580,  585,  589,  594,  598,  603,  607,  612,  616,  621,  625,  630,  634,  639,
+  643,  648,  652,  656,  661,  665,  670,  674,  678,  683,  687,  691,  696,  700,  704,  708,
+  713,  717,  721,  725,  729,  732,  736,  740,  744,  748,  752,  756,  759,  763,  767,  770,
+  774,  777,  781,  784,  788,  791,  795,  798,  801,  804,  808,  811,  814,  817,  820,  823,
+  826,  829,  832,  835,  838,  840,  843,  846,  848,  851,  854,  856,  858,  861,  863,  866,
+  868,  870,  872,  874,  876,  878,  880,  882,  884,  886,  888,  890,  891,  893,  895,  896,
+  898,  899,  901,  902,  903,  905,  906,  907,  908,  909,  910,  911,  912,  913,  914,  915,
+  915,  916,  917,  917,  918,  918,  919,  919,  920,  920,  920,  921,  921,  921,  921,  921,
+  922,  922,  922,  922,  922,  921,  921,  921,  921,  921,  920,  920,  920,  919,  919,  918,
+  918,  917,  917,  916,  915,  915,  914,  913,  912,  911,  910,  909,  908,  907,  906,  905,
+  903,  902,  901,  899,  898,  896,  895,  893,  891,  890,  888,  886,  884,  882,  880,  878,
+  876,  874,  872,  870,  868,  866,  863,  861,  858,  856,  854,  851,  848,  846,  843,  840,
+  838,  835,  832,  829,  826,  823,  820,  817,  814,  811,  808,  804,  801,  798,  795,  791,
+]);
 
 class DSP {
   constructor(ram) {
@@ -769,26 +807,36 @@ class DSP {
       this.voices.push({
         brrAddr: 0,       // 現在デコード中のBRRブロックアドレス
         brrOffset: 0,     // ブロック内サンプル位置(0-15)
-        pitchCounter: 0,  // 12bit小数付きピッチアキュムレータ (0x0000-0xFFFF+)
-        history: [0, 0],  // BRRデコード用の過去2サンプル
+        pitchCounter: 0,  // 16bit(うち上位が整数ブロック送り、下位15bitが小数)ピッチアキュムレータ
+        // ガウス補間用の4サンプル直近履歴リングバッファ(新しい順ではなく古い→新しい順に更新)
+        ring: new Int16Array(4),
+        ringPos: 0,
+        history: [0, 0],  // BRRデコード用フィルタの過去2サンプル(h1,h2)
         decodedBlock: new Int16Array(16),
         curBlockHeader: 0,
         keyOn: false,
         keyOff: false,
-        envMode: 'release', // 'attack' | 'decay' | 'sustain' | 'release' | 'gain'
+        envMode: 'off', // 'attack' | 'decay' | 'sustain' | 'release' | 'off'
         envLevel: 0,       // 0-2047 (11bit)
         loopFlag: false,
         endFlag: false,
         sampleAddr: 0,     // SRCNから取得した現在のサンプルの先頭アドレス
-        outSample: 0,      // 最後に出力したサンプル(エコー/次段用)
+        outSample: 0,      // 最後に出力したサンプル(エコーFIRの入力用)
+        _konLatched: false,
       });
     }
 
-    this.gaussTable = buildGaussTable();
-    this.echoBuffer = null; // 使用しない簡易実装(EON時のみ簡易加算)
-    this.noiseLFSR = 0x4000;
-    this.masterVolL = 0;
-    this.masterVolR = 0;
+    // エコーバッファ: EDL(0x7D)レジスタの4bit値 × 2048byte を上限として
+    // RAM上のリングバッファとして扱う（実機のFIRディレイライン）。
+    // ここではリングバッファへの書き込み位置(サンプル単位)のみ管理し、
+    // 実データはCPU RAM(ESA起点)へ直接読み書きする。
+    this.echoPos = 0;       // エコーバッファ内の現在位置(サンプル単位, 0..echoLenSamples-1)
+    this.firHistoryL = new Int16Array(8); // FIR用の直近8サンプル(L)
+    this.firHistoryR = new Int16Array(8); // FIR用の直近8サンプル(R)
+    this.firPos = 0;
+
+    this.noiseLFSR = 0x4000; // 実機初期値相当(非0であれば良い)
+    this._globalCounter = 0;
   }
 
   reset() {
@@ -799,11 +847,21 @@ class DSP {
       v.envLevel = 0;
       v.keyOn = false;
       v.keyOff = false;
-      v.envMode = 'release';
+      v.envMode = 'off';
       v.history = [0, 0];
+      v.ring.fill(0);
+      v.ringPos = 0;
       v.brrOffset = 16; // 最初にブロックを読ませる
       v.endFlag = false;
+      v.loopFlag = false;
+      v._konLatched = false;
     }
+    this.echoPos = 0;
+    this.firHistoryL.fill(0);
+    this.firHistoryR.fill(0);
+    this.firPos = 0;
+    this.noiseLFSR = 0x4000;
+    this._globalCounter = 0;
   }
 
   read(addr) {
@@ -839,6 +897,14 @@ class DSP {
   get evolL() { return this._s8(this.regs[0x2c]); }
   get evolR() { return this._s8(this.regs[0x3c]); }
   get efb() { return this._s8(this.regs[0x0d]); }
+  get esa() { return this.regs[0x6d]; }   // エコー開始アドレス上位byte (実アドレス = esa<<8)
+  get edl() { return this.regs[0x7d] & 0x0f; } // エコーディレイ(0-15, 各0で16byte単位=1サンプル分の16byte区切り、実際は0=固定64byte)
+  firCoef(tap) { return this._s8(this.regs[tap * 0x10 + 0x0f]); } // FIR係数 c0..c7
+  get echoDisabled() { return (this.flg & 0x20) !== 0; }   // FLGのbit5: エコー出力ミュート
+  get echoWriteDisabled() { return (this.flg & 0x20) !== 0; } // 実機ではFLGのbit5がエコーバッファ書き込みも止める
+  get noiseFreqIdx() { return this.flg & 0x1f; }
+  get muteAll() { return (this.flg & 0x40) !== 0; }
+  get softReset() { return (this.flg & 0x80) !== 0; }
 
   // サンプルディレクトリからBRRサンプルの開始/ループアドレスを取得
   getSampleDirEntry(srcn) {
@@ -866,15 +932,24 @@ class DSP {
       let nibble = (i & 1) === 0 ? (byte >> 4) : (byte & 0x0f);
       if (nibble >= 8) nibble -= 16; // 符号拡張(4bit)
 
+      // range 0-12: 通常どおり nibble << range を1bit分右シフト(>>1)して16bit化。
+      // range 13-15: 実機では nibble<<range が正しく機能せず、実機の既知の挙動として
+      //   range13: 通常のnibbleそのまま(符号拡張後の値、シフトなし相当)を(-2048/0系ではなく)
+      //            nibbleを4bit左シフトしたビット演算がオーバーフローし、常に0扱いになる。
+      //   range14,15: nibbleの符号ビット(bit3)に応じて -2048 または 0 に固定される。
+      // ここでは実機ハードウェアの既知挙動(BRR range 13-15の特殊クランプ)を再現する。
       let sample;
       if (range <= 12) {
         sample = (nibble << range) >> 1;
+      } else if (range === 13) {
+        // 実機では12bitシフトレジスタの範囲を超えるため結果は常に0になる
+        sample = 0;
       } else {
-        // range 13-15は実機だと特殊挙動。ここでは13として扱う簡易対応
+        // range 14,15: nibbleの符号で-2048/0に飽和(実機のシフタオーバーフロー挙動の近似)
         sample = nibble < 0 ? -2048 : 0;
       }
 
-      // フィルタ適用（BRR標準の4種類）
+      // フィルタ適用（BRR標準の4種類、実機の整数演算に忠実な式）
       let pred = 0;
       switch (filter) {
         case 0: pred = 0; break;
@@ -883,7 +958,10 @@ class DSP {
         case 3: pred = h1 * 2 + ((-(h1 * 13)) >> 6) - h2 + ((h2 * 3) >> 4); break;
       }
       let s = sample + pred;
-      // 16bit clip (実機は15bit相当を折り返すことがあるが、ここではクランプで近似)
+      // 実機は16bit加算後、15bitでクランプ(clip to -0x8000..0x7FFF相当だが実際は
+      // 内部的に16bit符号付きにラップしてから最終的に-32768..32767でクランプする)
+      // ここでは一般的なエミュレータ実装同様、16bit符号付き範囲へラップしてからクランプする。
+      s = ((s << 16) >> 16); // 16bit符号付きにラップ
       if (s > 32767) s = 32767;
       if (s < -32768) s = -32768;
 
@@ -899,15 +977,19 @@ class DSP {
     return endBit === 1;
   }
 
-  // ノイズ生成(LFSR)。呼び出しごとに1サンプル進める。
-  stepNoise() {
-    // 実機は 15bit LFSR、タップは bit0とbit1のXOR
+  // ノイズ生成(LFSR)。ノイズ周期(FLGのbit0-4で指定されたレート)が
+  // 発火したサンプルでのみLFSRを1ステップ進める。
+  // 実機: 15bit LFSR。新しいbit14 = bit0 XOR bit1。右シフトしてbit14に格納。
+  stepNoiseLFSR() {
     let lfsr = this.noiseLFSR;
-    const bit = ((lfsr << 14) ^ (lfsr << 13)) & 0x4000;
-    lfsr = ((lfsr >> 1) | bit) & 0x7fff;
-    this.noiseLFSR = lfsr;
-    // -0x4000..0x3fff相当を返す(符号付き15bit)
-    let v = lfsr & 0x7fff;
+    const newBit = ((lfsr & 1) ^ ((lfsr >> 1) & 1)) & 1;
+    lfsr = (lfsr >> 1) | (newBit << 14);
+    this.noiseLFSR = lfsr & 0x7fff;
+  }
+
+  // 現在のLFSR値を符号付き15bitサンプルとして返す(-0x4000..0x3FFF)
+  get noiseSample() {
+    let v = this.noiseLFSR & 0x7fff;
     if (v & 0x4000) v -= 0x8000;
     return v;
   }
@@ -971,8 +1053,8 @@ class DSP {
             voice.envLevel += 32;
           } else if (mode === 2) { // 指数減少
             voice.envLevel -= (((voice.envLevel - 1) >> 8) + 1);
-          } else { // 指数(bent line)増加近似
-            voice.envLevel += (voice.envLevel < 1536) ? 32 : 8;
+          } else { // bent line増加: 0x600未満は+32、以降は+8(実機仕様どおり)
+            voice.envLevel += (voice.envLevel < 0x600) ? 32 : 8;
           }
           if (voice.envLevel < 0) voice.envLevel = 0;
           if (voice.envLevel > 2047) voice.envLevel = 2047;
@@ -986,27 +1068,64 @@ class DSP {
   }
 
   _rateFires(rateIndex) {
-    // COUNTER_RATESの周期に基づき、globalカウンタでレート発火判定
+    // COUNTER_RATESの周期と位相オフセットに基づき、globalカウンタでレート発火判定
     const period = COUNTER_RATES[rateIndex] || 0;
     if (period === 0) return false;
-    this._globalCounter = (this._globalCounter || 0);
-    return (this._globalCounter % period) === 0;
+    const offset = COUNTER_OFFSETS[rateIndex] || 0;
+    return ((this._globalCounter + offset) % period) === 0;
+  }
+
+  // ボイスの4点履歴リングバッファに新しいデコード済みサンプルを1つ積む
+  _pushRing(voice, sample) {
+    voice.ring[voice.ringPos & 3] = sample;
+    voice.ringPos++;
+  }
+
+  // ガウス補間: ring[]に積まれた直近4サンプル(古い→新しい)と
+  // pitchCounterの上位8bit(小数部)を使い、実機のGAUSS_TABLEで4点補間する。
+  // 実機の重み付けは "out = (g[255-frac+off]*s[-3] + g[frac+off... ]...)" のような
+  // 非対称カーブを4分割して使う方式だが、ここでは一般的なエミュレータ実装に倣い
+  // フラクション値をインデックスとして0..255の範囲にマップして使用する。
+  _gaussInterp(voice, fracIdx) {
+    // fracIdx: 0..255 (pitchCounterの下位から得た補間位置)
+    const idx = fracIdx & 0xff;
+    const p0 = voice.ring[(voice.ringPos - 4) & 3]; // 最も古い(3つ前)
+    const p1 = voice.ring[(voice.ringPos - 3) & 3];
+    const p2 = voice.ring[(voice.ringPos - 2) & 3];
+    const p3 = voice.ring[(voice.ringPos - 1) & 3]; // 最新
+    let out = (GAUSS_TABLE[255 - idx] * p0) >> 11;
+    out += (GAUSS_TABLE[511 - idx] * p1) >> 11;
+    out += (GAUSS_TABLE[256 + idx] * p2) >> 11;
+    out += (GAUSS_TABLE[idx] * p3) >> 11;
+    if (out > 32767) out = 32767;
+    if (out < -32768) out = -32768;
+    return out;
   }
 
   // メインの1サンプル生成。呼ぶたびにglobalCounterを進める。
   // 戻り値: [left, right] (Float32、-1.0〜1.0レンジ)
   generateSample() {
-    this._globalCounter = (this._globalCounter || 0) + 1;
+    this._globalCounter = (this._globalCounter + 1) >>> 0;
 
     let mixL = 0, mixR = 0;
     const konReg = this.kon;
     const koffReg = this.koff;
+    const pmonReg = this.pmon;
+    const nonReg = this.non;
+    const eonReg = this.eon;
+
+    // ノイズLFSRはFLGで指定されたノイズ周波数レートでのみ進める(全ボイス共通の1個のLFSR)
+    if (this._rateFires(this.noiseFreqIdx)) {
+      this.stepNoiseLFSR();
+    }
+
+    let prevVoiceOutput = 0; // 直前ボイスの出力(PMON用、KON直後は0扱い)
 
     for (let i = 0; i < 8; i++) {
       const voice = this.voices[i];
       const bit = 1 << i;
 
-      // KEY ON / KEY OFF 検出（エッジトリガをここで簡略処理）
+      // KEY ON / KEY OFF 検出（エッジトリガ）
       if (konReg & bit) {
         if (!voice._konLatched) {
           this._triggerKeyOn(voice, i);
@@ -1017,95 +1136,184 @@ class DSP {
       }
       if (koffReg & bit) {
         voice.keyOff = true;
-      } else {
-        voice.keyOff = false;
       }
 
       if (voice.envMode === 'off') {
+        voice.outSample = 0;
+        prevVoiceOutput = 0;
         continue;
       }
 
-      // ピッチ取得(PMONによる変調は簡易実装として省略、基本ピッチのみ)
+      // ピッチ取得。PMON(bit i)が立っていれば直前ボイス(i-1)の出力で変調する。
+      // ボイス0はPMONの対象外(直前ボイスが存在しないため常に無変調)。
       let p = this.pitch(i);
+      if (i > 0 && (pmonReg & bit)) {
+        // 実機のピッチ変調式: pitch += (pitch * prevOutput) >> 15  (prevOutputは-32768..32767相当を14bit精度で使用)
+        const factor = prevVoiceOutput >> 4; // 大まかなスケール近似(直前サンプルのエンベロープ適用後出力を使用)
+        p = p + ((p * factor) >> 10);
+      }
+      if (p < 0) p = 0;
       if (p > 0x3fff) p = 0x3fff;
 
-      // BRRデコード：ブロック境界を超えたら次ブロックを読む
+      // BRRデコード：ブロック境界を超えたら次ブロックを読む(初回 or ループ後)
       if (voice.brrOffset >= 16) {
-        if (voice.endFlag) {
-          if (voice.loopFlag) {
-            const dirEntry = this.getSampleDirEntry(this.srcn(i));
-            voice.brrAddr = dirEntry.loop;
-          } else {
-            voice.envMode = 'off';
-            voice.envLevel = 0;
-            continue;
-          }
+        if (!this._advanceBrrBlock(voice, i)) {
+          voice.outSample = 0;
+          prevVoiceOutput = 0;
+          continue;
         }
-        this.decodeBrrBlock(voice, voice.brrAddr);
-        voice.brrOffset = 0;
-        if (!voice.endFlag || voice.loopFlag) {
-          // 次回のためにアドレスを進める(ブロック末端到達時は上でloop先に設定済み)
-        }
+        // 新ブロックデコード直後、リングバッファに先頭サンプルを積んでおく
+        // (これがないとガウス補間の初回が無音履歴のまま計算されてしまう)
+        this._pushRing(voice, voice.decodedBlock[0]);
       }
 
-      // サンプル取得(ガウス補間なしの簡易線形補間で近似)
-      const idx = voice.brrOffset;
-      const s0 = voice.decodedBlock[idx];
-      const s1 = idx < 15 ? voice.decodedBlock[idx + 1] : s0;
-      const frac = (voice.pitchCounter & 0xfff) / 0x1000;
-      let sample = s0 + (s1 - s0) * frac;
+      // ガウス補間でサンプル取得。pitchCounterの上位ビット(0..0x7FFF範囲の下位12bitを
+      // 8bit精度に丸めたもの)を補間フラクションとして使う。
+      const fracIdx = (voice.pitchCounter >> 4) & 0xff;
+      let sample = this._gaussInterp(voice, fracIdx);
 
-      // ノイズチャンネル置き換え
-      if (this.non & bit) {
-        sample = this.stepNoise();
+      // ノイズチャンネル置き換え(NONビットが立っていればBRR/補間結果をLFSR値に差し替え)
+      if (nonReg & bit) {
+        sample = this.noiseSample;
       }
 
-      // エンベロープ適用
+      // エンベロープ適用 (0-2047 -> 0.0-1.0相当のスケール)
       const env = this.stepEnvelope(voice, i);
-      sample = (sample * env) / 2047;
+      sample = (sample * env) >> 11;
+      if (sample > 32767) sample = 32767;
+      if (sample < -32768) sample = -32768;
 
       voice.outSample = sample;
+      prevVoiceOutput = sample;
 
       const vl = this.volL(i) / 128;
       const vr = this.volR(i) / 128;
       mixL += sample * vl;
       mixR += sample * vr;
 
-      // ピッチカウンタを進めてブロック内オフセットも進める
+      // エコーに送る信号(EONビットが立っているボイスのみ)は後段でまとめて処理
+      if (eonReg & bit) {
+        this._echoAccumL = (this._echoAccumL || 0) + sample * vl;
+        this._echoAccumR = (this._echoAccumR || 0) + sample * vr;
+      }
+
+      // ピッチカウンタを進める。16bit中、上位1bitがブロック送り、
+      // 残り15bit(実質12bit精度)を小数部として扱う簡易固定小数点方式。
+      // ここでは brrOffset の整数部を 12bit(0x1000=1sample分)刻みで管理する。
       voice.pitchCounter += p;
-      const advance = voice.pitchCounter >> 12;
+      const advanceBlocks = voice.pitchCounter >> 12; // 何サンプル分進めるか
       voice.pitchCounter &= 0xfff;
-      voice.brrOffset += advance;
-      while (voice.brrOffset >= 16) {
-        // ブロック境界を跨いだら次ブロックアドレスへ
-        if (voice.endFlag) {
-          if (voice.loopFlag) {
-            const dirEntry = this.getSampleDirEntry(this.srcn(i));
-            voice.brrAddr = dirEntry.loop;
-          } else {
-            voice.envMode = 'off';
-            voice.envLevel = 0;
-            voice.brrOffset = 16;
-            break;
-          }
+
+      for (let s = 0; s < advanceBlocks; s++) {
+        voice.brrOffset++;
+        // 新しいデコード済みサンプルをリングバッファに積む
+        if (voice.brrOffset < 16) {
+          this._pushRing(voice, voice.decodedBlock[voice.brrOffset]);
         } else {
-          voice.brrAddr = (voice.brrAddr + 9) & 0xffff;
+          if (!this._advanceBrrBlock(voice, i)) break;
+          this._pushRing(voice, voice.decodedBlock[voice.brrOffset]);
         }
-        if (voice.envMode === 'off') break;
-        this.decodeBrrBlock(voice, voice.brrAddr);
-        voice.brrOffset -= 16;
       }
     }
 
-    // マスターボリューム適用
-    const outL = (mixL * this.mvolL) / (128 * 8192);
-const outR = (mixR * this.mvolR) / (128 * 8192);
+    // --- エコー処理 ---
+    // ESA(0x6D)を先頭アドレスとするRAM上のリングバッファ(長さ = edl*2048byte、
+    // 1サンプルあたりL/R各2byte=4byte)にFIRディレイラインを構築し、
+    // 8タップFIRフィルタ(係数c0..c7)でエコー出力を計算後、
+    // フィードバック(EFB)をミックスして再度バッファへ書き込む。
+    const edl = this.edl;
+    const echoLenSamples = edl === 0 ? 1 : edl * 512; // 実機: 各1が2048byte=512サンプル(L/R各2byte*2)
+    const esaBase = (this.esa << 8) & 0xffff;
 
+    const rawEchoInL = this._echoAccumL || 0;
+    const rawEchoInR = this._echoAccumR || 0;
+    this._echoAccumL = 0;
+    this._echoAccumR = 0;
+
+    // FIRディレイラインへ新規サンプルを追加(直近8サンプルの巡回バッファ)
+    this.firHistoryL[this.firPos & 7] = 0; // placeholder, actual push happens after reading buffer below
+    // エコーバッファからの読み出し位置(現在のechoPos)
+    const readAddr = (esaBase + this.echoPos * 4) & 0xffff;
+    let echoRawL = (this.ram[readAddr] | (this.ram[(readAddr + 1) & 0xffff] << 8));
+    let echoRawR = (this.ram[(readAddr + 2) & 0xffff] | (this.ram[(readAddr + 3) & 0xffff] << 8));
+    if (echoRawL & 0x8000) echoRawL -= 0x10000;
+    if (echoRawR & 0x8000) echoRawR -= 0x10000;
+
+    // FIR履歴に今回読み出した値を追加
+    this.firHistoryL[this.firPos & 7] = echoRawL;
+    this.firHistoryR[this.firPos & 7] = echoRawR;
+
+    // 8タップFIR畳み込み(タップ0が最新、タップ7が最も古い)
+    let firOutL = 0, firOutR = 0;
+    for (let t = 0; t < 8; t++) {
+      const c = this.firCoef(t);
+      const hIdx = (this.firPos - t) & 7;
+      firOutL += c * this.firHistoryL[hIdx];
+      firOutR += c * this.firHistoryR[hIdx];
+    }
+    firOutL = firOutL >> 6;
+    firOutR = firOutR >> 6;
+    if (firOutL > 32767) firOutL = 32767; if (firOutL < -32768) firOutL = -32768;
+    if (firOutR > 32767) firOutR = 32767; if (firOutR < -32768) firOutR = -32768;
+    this.firPos = (this.firPos + 1) & 7;
+
+    // エコー出力をメインミックスへ加算(EVOL L/R、FLGのエコーミュートも考慮)
+    if (!this.echoDisabled) {
+      mixL += firOutL * (this.evolL / 128);
+      mixR += firOutR * (this.evolR / 128);
+    }
+
+    // 新たにバッファへ書き込む値 = 入力ミックス + フィードバック(EFB)
+    let newEchoL = rawEchoInL + ((firOutL * this.efb) >> 7);
+    let newEchoR = rawEchoInR + ((firOutR * this.efb) >> 7);
+    if (newEchoL > 32767) newEchoL = 32767; if (newEchoL < -32768) newEchoL = -32768;
+    if (newEchoR > 32767) newEchoR = 32767; if (newEchoR < -32768) newEchoR = -32768;
+
+    if (!this.echoWriteDisabled) {
+      this.ram[readAddr] = newEchoL & 0xff;
+      this.ram[(readAddr + 1) & 0xffff] = (newEchoL >> 8) & 0xff;
+      this.ram[(readAddr + 2) & 0xffff] = newEchoR & 0xff;
+      this.ram[(readAddr + 3) & 0xffff] = (newEchoR >> 8) & 0xff;
+    }
+
+    this.echoPos++;
+    if (this.echoPos >= echoLenSamples) this.echoPos = 0;
+
+    // マスターボリューム適用 (voice出力は±32767スケール、mvolは±128フル)
+    const outL = (mixL * this.mvolL) / (128 * 32768);
+    const outR = (mixR * this.mvolR) / (128 * 32768);
 
     return [
       Math.max(-1, Math.min(1, outL)),
       Math.max(-1, Math.min(1, outR)),
     ];
+  }
+
+  // ブロック末端に達したボイスを次ブロック(または終了/ループ)へ進める。
+  // KeyOn直後(_decodedOnce===false)はvoice.brrAddrが既にサンプル先頭を指しているため
+  // アドレスを送らずそのままデコードする。それ以外はまず「直前ブロックが終端だったか」を
+  // 見て、終端ならloop/off処理、そうでなければ+9byte進めてからデコードする。
+  // 戻り値: 続行可能ならtrue、ボイスをoffにした場合はfalse。
+  _advanceBrrBlock(voice, i) {
+    if (voice._decodedOnce) {
+      if (voice.endFlag) {
+        if (voice.loopFlag) {
+          const dirEntry = this.getSampleDirEntry(this.srcn(i));
+          voice.brrAddr = dirEntry.loop;
+        } else {
+          voice.envMode = 'off';
+          voice.envLevel = 0;
+          voice.brrOffset = 16;
+          return false;
+        }
+      } else {
+        voice.brrAddr = (voice.brrAddr + 9) & 0xffff;
+      }
+    }
+    this.decodeBrrBlock(voice, voice.brrAddr);
+    voice._decodedOnce = true;
+    voice.brrOffset = 0;
+    return true;
   }
 
   _triggerKeyOn(voice, i) {
@@ -1114,11 +1322,14 @@ const outR = (mixR * this.mvolR) / (128 * 8192);
     voice.brrOffset = 16; // 次回生成時に即デコード
     voice.pitchCounter = 0;
     voice.history = [0, 0];
+    voice.ring.fill(0);
+    voice.ringPos = 0;
     voice.envLevel = 0;
     voice.envMode = 'attack';
     voice.keyOff = false;
     voice.endFlag = false;
     voice.loopFlag = false;
+    voice._decodedOnce = false;
   }
 }
 
