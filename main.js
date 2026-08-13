@@ -4,6 +4,7 @@
 // ============================================================================
 
 (() => {
+  
   const dropzone = document.getElementById('dropzone');
   const fileInput = document.getElementById('fileInput');
   const playBtn = document.getElementById('playBtn');
@@ -15,6 +16,20 @@
   const trackDumper = document.getElementById('trackDumper');
   const volumeSlider = document.getElementById('volumeSlider');
   const volumeLabel = document.getElementById('volumeLabel');
+const voiceTable = document.getElementById("voiceTable");
+
+function updateVoiceInfo(voices) {
+    voiceTable.innerHTML = voices.map(v => `
+        <tr>
+            <td>${v.voice}</td>
+            <td>${v.active ? "ON" : "OFF"}</td>
+            <td>${v.volumeL}</td>
+            <td>${v.volumeR}</td>
+            <td>${v.active ? pitchToNote(v.pitch) : "-"}</td>
+            <td>0x${v.pitch.toString(16).padStart(4, "0").toUpperCase()}</td>
+        </tr>
+    `).join("");
+}
 
   let audioContext = null;
   let workletNode = null;
@@ -61,6 +76,20 @@
       } else if (msg.type === 'error') {
         setStatus('エラー: ' + msg.message, 'error');
       }
+      if (msg.type === "voiceInfo") {
+        updateVoiceInfo(msg.voices);
+        return;
+    }
+
+    if (msg.type === "loaded") {
+        console.log("SPC loaded");
+        return;
+    }
+
+    if (msg.type === "error") {
+        console.error(msg.message);
+        return;
+    }
     };
   }
 
