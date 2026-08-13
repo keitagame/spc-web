@@ -28,9 +28,8 @@ class SPC700 {
     this.flagZ = 0; // Zero
     this.flagC = 0; // Carry
 
-    // I/O ポート $F4-$F7 (CPU<->DSP/メインCPU通信用。ここでは自己ループのみ実装)
-    this.ioPortIn = new Uint8Array(4);  // メインCPUから見た入力（今回は使わない）
-    this.ioPortOut = new Uint8Array(4); // SPC700から見た出力
+    // I/O ポート $F4-$F7 (メインCPUとの通信用。SPC700からは自分が書いた値がそのまま読み返せる=自己ループバックが実機の仕様)
+    this.ioPort = new Uint8Array(4);
 
     // タイマー (0,1,2)
     this.timerEnable = [0, 0, 0];
@@ -52,7 +51,7 @@ class SPC700 {
       case 0xf2: return this.dsp.regAddr;
       case 0xf3: return this.dsp.read(this.dsp.regAddr);
       case 0xf4: case 0xf5: case 0xf6: case 0xf7:
-        return this.ioPortIn[addr - 0xf4];
+        return this.ioPort[addr - 0xf4];
       case 0xfd: return this.readTimerOut(0);
       case 0xfe: return this.readTimerOut(1);
       case 0xff: return this.readTimerOut(2);
@@ -66,8 +65,8 @@ class SPC700 {
     val &= 0xff;
     switch (addr) {
       case 0xf1: // CONTROL
-        if (val & 0x10) { this.ioPortIn[0] = 0; this.ioPortIn[1] = 0; }
-        if (val & 0x20) { this.ioPortIn[2] = 0; this.ioPortIn[3] = 0; }
+        if (val & 0x10) { this.ioPort[0] = 0; this.ioPort[1] = 0; }
+        if (val & 0x20) { this.ioPort[2] = 0; this.ioPort[3] = 0; }
         for (let t = 0; t < 3; t++) {
           const en = (val >> t) & 1;
           if (en && !this.timerEnable[t]) {
@@ -87,7 +86,7 @@ class SPC700 {
         this.ram[addr] = val;
         break;
       case 0xf4: case 0xf5: case 0xf6: case 0xf7:
-        this.ioPortOut[addr - 0xf4] = val;
+        this.ioPort[addr - 0xf4] = val;
         this.ram[addr] = val;
         break;
       case 0xfa: this.timerTarget[0] = val === 0 ? 256 : val; this.ram[addr] = val; break;
@@ -1170,6 +1169,12 @@ class SPCEngine {
     const ioRegs = [0xfa, 0xfb, 0xfc, 0xf1]; // タイマーターゲット3つ + CONTROL
     for (const addr of ioRegs) {
       this.cpu.write(addr, parsed.ram[addr]);
+    }
+    // I/Oポート$F4-$F7もSPCファイル保存時点の値を復元する
+    // (SPC700からは自分が最後に書いた値がそのまま読み返せるのが実機の仕様のため、
+    //  保存されたRAMスナップショットの値をそのままioPortへ反映する)
+    for (let i = 0; i < 4; i++) {
+      this.cpu.ioPort[i] = parsed.ram[0xf4 + i];
     }
     // タイマーのカウンタ/出力は曲頭では0から始めるのが自然なため明示的にクリアする
     this.cpu.timerCounter = [0, 0, 0];
