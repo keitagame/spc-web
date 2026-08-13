@@ -36,7 +36,12 @@ class SPC700 {
     this.timerTarget = [0, 0, 0];
     this.timerCounter = [0, 0, 0]; // 内部分周カウンタ
     this.timerOut = [0, 0, 0];     // 読み出し用4bitカウンタ
+this.voiceInfoCounter++;
 
+if (this.voiceInfoCounter >= 10) {
+    this.voiceInfoCounter = 0;
+    this._sendVoiceInfo();
+}
     this.cycles = 0; // 実行済みサイクル数（タイミング管理用）
 this.infoCounter = 0;
     this._buildOpTable();
@@ -1274,77 +1279,79 @@ class SPCPlayerProcessor extends AudioWorkletProcessor {
     this.nextL = l;
     this.nextR = r;
   }
+_sendVoiceInfo() {
+    const dsp = this.engine.dsp;
 
-  process(inputs, outputs) {
+    const voices = [];
+
+    for (let i = 0; i < 8; i++) {
+        const voice = dsp.voices[i];
+
+        voices.push({
+            voice: i + 1,
+
+            // 左右のVOLレジスタ
+            volumeL: dsp.volL(i),
+            volumeR: dsp.volR(i),
+
+            // PITCHレジスタ
+            pitch: dsp.pitch(i),
+
+            // エンベロープ
+            envelope: voice.envLevel,
+
+            // 発音中か
+            active: voice.envMode !== "off"
+        });
+    }
+
+    this.port.postMessage({
+        type: "voiceInfo",
+        voices: voices
+    });
+}
+process(inputs, outputs) {
     const output = outputs[0];
     const left = output[0];
     const right = output[1] || output[0];
     const n = left.length;
 
     if (!this.playing || !this.engine.loaded) {
-      left.fill(0);
-      if (right !== left) right.fill(0);
-      return true;
+        left.fill(0);
+        if (right !== left) right.fill(0);
+        return true;
     }
 
     if (!this.haveSample) {
-      // 最初の2点を用意する
-      this._advanceDspSample();
-      this._advanceDspSample();
-      this.haveSample = true;
+        this._advanceDspSample();
+        this._advanceDspSample();
+        this.haveSample = true;
     }
 
     for (let i = 0; i < n; i++) {
-      // srcPosが1.0を超えるたびにDSPサンプルを1つ進める
-      while (this.srcPos >= 1) {
-        this._advanceDspSample();
-        this.srcPos -= 1;
-      }
-      const frac = this.srcPos;
-      left[i] = this.prevL + (this.nextL - this.prevL) * frac;
-      right[i] = this.prevR + (this.nextR - this.prevR) * frac;
-      this.srcPos += this.resampleRatio;
+        while (this.srcPos >= 1) {
+            this._advanceDspSample();
+            this.srcPos -= 1;
+        }
+
+        const frac = this.srcPos;
+
+        left[i] =
+            this.prevL +
+            (this.nextL - this.prevL) * frac;
+
+        right[i] =
+            this.prevR +
+            (this.nextR - this.prevR) * frac;
+
+        this.srcPos += this.resampleRatio;
     }
-    // 約10回/秒でボイス情報をメインスレッドへ送信
-this.infoCounter++;
 
-if (this.infoCounter >= 5) {
-  this.infoCounter = 0;
+    // ★ ここを追加
+    this._sendVoiceInfo();
 
-  const dsp = this.engine.dsp;
-
-  const voices = [];
-
-  for (let i = 0; i < 8; i++) {
-    const voice = dsp.voices[i];
-
-    const volL = dsp.volL(i);
-    const volR = dsp.volR(i);
-
-    // DSPのPITCHレジスタ値
-    const pitch = dsp.pitch(i);
-
-    // 実際に鳴っているか
-    const active =
-      voice.envMode !== 'off' &&
-      voice.envLevel > 0;
-
-    voices.push({
-      voice: i + 1,
-      active,
-      volumeL: volL,
-      volumeR: volR,
-      pitch
-    });
-  }
-
-  this.port.postMessage({
-    type: 'voiceInfo',
-    voices
-  });
-}
     return true;
-  }
+}
 }
 function pitchToNote(pitch) {
     if (!pitch) return "-";
