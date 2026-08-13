@@ -38,7 +38,7 @@ class SPC700 {
     this.timerOut = [0, 0, 0];     // 読み出し用4bitカウンタ
 
     this.cycles = 0; // 実行済みサイクル数（タイミング管理用）
-
+this.infoCounter = 0;
     this._buildOpTable();
   }
 
@@ -1305,9 +1305,69 @@ class SPCPlayerProcessor extends AudioWorkletProcessor {
       right[i] = this.prevR + (this.nextR - this.prevR) * frac;
       this.srcPos += this.resampleRatio;
     }
+    // 約10回/秒でボイス情報をメインスレッドへ送信
+this.infoCounter++;
 
+if (this.infoCounter >= 5) {
+  this.infoCounter = 0;
+
+  const dsp = this.engine.dsp;
+
+  const voices = [];
+
+  for (let i = 0; i < 8; i++) {
+    const voice = dsp.voices[i];
+
+    const volL = dsp.volL(i);
+    const volR = dsp.volR(i);
+
+    // DSPのPITCHレジスタ値
+    const pitch = dsp.pitch(i);
+
+    // 実際に鳴っているか
+    const active =
+      voice.envMode !== 'off' &&
+      voice.envLevel > 0;
+
+    voices.push({
+      voice: i + 1,
+      active,
+      volumeL: volL,
+      volumeR: volR,
+      pitch
+    });
+  }
+
+  this.port.postMessage({
+    type: 'voiceInfo',
+    voices
+  });
+}
     return true;
   }
 }
+function pitchToNote(pitch) {
+    if (!pitch) return "-";
 
+    // SPC700のピッチ値から周波数を概算
+    const freq = 32000 * pitch / 4096;
+
+    if (!isFinite(freq) || freq <= 0) {
+        return "-";
+    }
+
+    const noteNames = [
+        "C", "C#", "D", "D#", "E", "F",
+        "F#", "G", "G#", "A", "A#", "B"
+    ];
+
+    const midi = Math.round(
+        69 + 12 * Math.log2(freq / 440)
+    );
+
+    const octave = Math.floor(midi / 12) - 1;
+    const name = noteNames[((midi % 12) + 12) % 12];
+
+    return `${name}${octave}`;
+}
 registerProcessor('spc-player-processor', SPCPlayerProcessor);
