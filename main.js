@@ -17,7 +17,30 @@
   const volumeSlider = document.getElementById('volumeSlider');
   const volumeLabel = document.getElementById('volumeLabel');
 const voiceTable = document.getElementById("voiceTable");
+function pitchToNote(pitch) {
+    if (!pitch) return "-";
 
+    // SPC700のピッチ値から周波数を概算
+    const freq = 32000 * pitch / 4096;
+
+    if (!isFinite(freq) || freq <= 0) {
+        return "-";
+    }
+
+    const noteNames = [
+        "C", "C#", "D", "D#", "E", "F",
+        "F#", "G", "G#", "A", "A#", "B"
+    ];
+
+    const midi = Math.round(
+        69 + 12 * Math.log2(freq / 440)
+    );
+
+    const octave = Math.floor(midi / 12) - 1;
+    const name = noteNames[((midi % 12) + 12) % 12];
+
+    return `${name}${octave}`;
+}
 function updateVoiceInfo(voices) {
     voiceTable.innerHTML = voices.map(v => `
         <tr>
