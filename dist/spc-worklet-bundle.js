@@ -1101,7 +1101,7 @@ class DSP {
       }
     }
 
-    // マスターボリューム適用
+    /*// マスターボリューム適用
     const outL = (mixL * this.mvolL) / (128 * 8192);
 const outR = (mixR * this.mvolR) / (128 * 8192);
 
@@ -1110,6 +1110,11 @@ const outR = (mixR * this.mvolR) / (128 * 8192);
       Math.max(-1, Math.min(1, outL)),
       Math.max(-1, Math.min(1, outR)),
     ];
+    */
+    const outL = (mixL * this.mvolL) / (128 * 8192) * 0.70;
+const outR = (mixR * this.mvolR) / (128 * 8192) * 0.70;
+
+return [outL, outR];
   }
 
   _triggerKeyOn(voice, i) {
