@@ -1106,8 +1106,8 @@ let outL = (mixL * this.mvolL) / (128 * 8192);
 let outR = (mixR * this.mvolR) / (128 * 8192);
 
 // ヘッドルームを確保
-outL *= 0.70;
-outR *= 0.70;
+outL *= 0.50;
+outR *= 0.50;
 
 // ソフトクリップ
 outL = Math.tanh(outL);
