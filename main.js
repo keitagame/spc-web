@@ -74,8 +74,18 @@ function updateVoiceInfo(voices) {
   async function ensureAudioContext() {
     if (audioContext) return;
 
-    audioContext = new (window.AudioContext || window.webkitAudioContext);
+    
+const audioOptions = {
+  // サンプルレートを 48000Hz (または 44100Hz) に固定
+  sampleRate: 48000, 
+  
+  // 音質最優先（再生の滑らかさ重視）に設定
+  latencyHint: 'playback' 
+};
 
+// レガシーブラウザ（フォールバック）対応を含めた初期化
+const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+const audioContext = new AudioContextClass(audioOptions);
     await audioContext.audioWorklet.addModule('dist/spc-worklet-bundle.js');
 
     workletNode = new AudioWorkletNode(audioContext, 'spc-player-processor', {
