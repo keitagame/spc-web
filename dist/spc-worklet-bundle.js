@@ -1101,18 +1101,17 @@ class DSP {
       }
     }
 
-    /*// マスターボリューム適用
-    const outL = (mixL * this.mvolL) / (128 * 8192);
-const outR = (mixR * this.mvolR) / (128 * 8192);
+  // マスターボリューム適用
+let outL = (mixL * this.mvolL) / (128 * 8192);
+let outR = (mixR * this.mvolR) / (128 * 8192);
 
+// ヘッドルームを確保
+outL *= 0.70;
+outR *= 0.70;
 
-    return [
-      Math.max(-1, Math.min(1, outL)),
-      Math.max(-1, Math.min(1, outR)),
-    ];
-    */
-    const outL = (mixL * this.mvolL) / (128 * 8192) * 0.70;
-const outR = (mixR * this.mvolR) / (128 * 8192) * 0.70;
+// ソフトクリップ
+outL = Math.tanh(outL);
+outR = Math.tanh(outR);
 
 return [outL, outR];
   }
