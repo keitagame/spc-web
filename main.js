@@ -76,7 +76,7 @@ function updateVoiceInfo(voices) {
 
 
 
-    let audioContext = new (window.AudioContext || window.webkitAudioContext);
+     audioContext = new (window.AudioContext || window.webkitAudioContext);
     await audioContext.audioWorklet.addModule('dist/spc-worklet-bundle.js');
 
     workletNode = new AudioWorkletNode(audioContext, 'spc-player-processor', {
