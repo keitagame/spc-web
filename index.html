@@ -62,8 +62,292 @@
   </div>
 </div>
 </div>
+<script src="spc.js">
 
-<script src="spc-parser.js"></script>
-<script src="main.js"></script>
+</script>
+<script>
+  // ============================================================================
+// SPCファイルパーサー
+// .spc フォーマット (v0.30, ヘッダ256byte + RAM 64KB + DSPレジスタ128byte + ...)
+// 参考: SPC700 File Format specification
+// ============================================================================
+
+function parseSPC(arrayBuffer) {
+  const buf = new Uint8Array(arrayBuffer);
+  const dv = new DataView(arrayBuffer);
+
+  // ヘッダチェック "SNES-SPC700 Sound File Data"
+  const headerText = String.fromCharCode(...buf.slice(0, 33));
+  if (!headerText.startsWith('SNES-SPC700')) {
+    throw new Error('SPCファイルのヘッダが不正です（SNES-SPC700シグネチャが見つかりません）');
+  }
+
+  const hasID666 = buf[0x23] === 26 || buf[0x23] === 27; // 0x1A(26)=タグあり, 0x1B(27)=タグなし版もある実装差異に対応
+  // 実際の仕様: offset 0x23 が 0x1A固定でヘッダ終端マーカー、0x24がID666タグの有無(1=あり,0=なし)
+  const id666Flag = buf[0x24];
+
+  // レジスタ情報 (offset 0x25-0x2D)
+  const pc = dv.getUint16(0x25, true);
+  const a = buf[0x27];
+  const x = buf[0x28];
+  const y = buf[0x29];
+  const psw = buf[0x2a];
+  const sp = buf[0x2b];
+
+  // ID666タグ (offset 0x2E - 0xD0) 曲情報
+  let songTitle = '', gameTitle = '', dumperName = '', comments = '', dateDumped = '';
+  let artist = '';
+  try {
+    songTitle = readTagString(buf, 0x2e, 32);
+    gameTitle = readTagString(buf, 0x4e, 32);
+    dumperName = readTagString(buf, 0x6e, 16);
+    comments = readTagString(buf, 0x7e, 32);
+    artist = readTagString(buf, 0xb1, 32);
+  } catch (e) {
+    // タグが壊れていても再生自体は継続する
+  }
+
+  // RAMデータ: offset 0x100 から 65536 byte
+  const ramStart = 0x100;
+  const ram = buf.slice(ramStart, ramStart + 0x10000);
+
+  // DSPレジスタ: offset 0x10100 から 128 byte
+  const dspStart = 0x10100;
+  const dspRegs = buf.slice(dspStart, dspStart + 0x80);
+
+  return {
+    pc, a, x, y, psw, sp,
+    ram,
+    dspRegs,
+    tags: { songTitle, gameTitle, artist, dumperName, comments },
+  };
+}
+
+function readTagString(buf, offset, length) {
+  let end = offset;
+  const max = offset + length;
+  while (end < max && buf[end] !== 0) end++;
+  const bytes = buf.slice(offset, end);
+  // Shift-JISの可能性もあるが、まずUTF-8/ASCIIとしてデコードを試みる
+  try {
+    return new TextDecoder('shift-jis', { fatal: false }).decode(bytes).trim();
+  } catch (e) {
+    return String.fromCharCode(...bytes).trim();
+  }
+}
+
+if (typeof module !== 'undefined') module.exports = { parseSPC };
+</script>
+<script>
+  // ============================================================================
+// メインスレッド制御スクリプト
+// ファイル選択/ドロップ -> SPCパース -> AudioWorkletへ転送 -> 再生制御
+// ============================================================================
+
+(() => {
+  
+  const dropzone = document.getElementById('dropzone');
+  const fileInput = document.getElementById('fileInput');
+  const playBtn = document.getElementById('playBtn');
+  const statusEl = document.getElementById('status');
+  const trackInfo = document.getElementById('trackInfo');
+  const trackTitle = document.getElementById('trackTitle');
+  const trackGame = document.getElementById('trackGame');
+  const trackArtist = document.getElementById('trackArtist');
+  const trackDumper = document.getElementById('trackDumper');
+  const volumeSlider = document.getElementById('volumeSlider');
+  const volumeLabel = document.getElementById('volumeLabel');
+const voiceTable = document.getElementById("voiceTable");
+function pitchToNote(pitch) {
+    if (!pitch) return "-";
+
+    // SPC700のピッチ値から周波数を概算
+    const freq = 32000 * pitch / 4096;
+
+    if (!isFinite(freq) || freq <= 0) {
+        return "-";
+    }
+
+    const noteNames = [
+        "C", "C#", "D", "D#", "E", "F",
+        "F#", "G", "G#", "A", "A#", "B"
+    ];
+
+    const midi = Math.round(
+        69 + 12 * Math.log2(freq / 440)
+    );
+
+    const octave = Math.floor(midi / 12) - 1;
+    const name = noteNames[((midi % 12) + 12) % 12];
+
+    return `${name}${octave}`;
+}
+function updateVoiceInfo(voices) {
+    voiceTable.innerHTML = voices.map(v => `
+        <tr>
+            <td>${v.voice}</td>
+            <td>${v.active ? "ON" : "OFF"}</td>
+            <td>${v.volumeL}</td>
+            <td>${v.volumeR}</td>
+            <td>${v.active ? pitchToNote(v.pitch) : "-"}</td>
+            <td>0x${v.pitch.toString(16).padStart(4, "0").toUpperCase()}</td>
+        </tr>
+    `).join("");
+}
+
+  let audioContext = null;
+  let workletNode = null;
+  let gainNode = null;
+  let isPlaying = false;
+  let isLoaded = false;
+  let currentParsed = null;
+
+  function setStatus(msg, kind) {
+    statusEl.textContent = msg;
+    statusEl.className = 'status' + (kind ? ' ' + kind : '');
+  }
+
+  // --------------------------------------------------------------------
+  // AudioContext / AudioWorklet 初期化
+  // SDSPは32000Hz固定でサンプルを生成する仕様のため、AudioContextの
+  // サンプルレートも32000Hzで作成し、リサンプリングなしで直結する。
+  // --------------------------------------------------------------------
+  async function ensureAudioContext() {
+    if (audioContext) return;
+
+const audioOptions = {
+  // サンプルレートを 48000Hz (または 44100Hz) に固定
+  sampleRate: 48000, 
+  
+  // 音質最優先（再生の滑らかさ重視）に設定
+  latencyHint: 'playback' 
+};
+
+// レガシーブラウザ（フォールバック）対応を含めた初期化
+const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+audioContext = new AudioContextClass(audioOptions);
+
+   
+  
+
+    gainNode = audioContext.createGain();
+    gainNode.gain.value = Number(volumeSlider.value) / 100;
+
+    gainNode.connect(audioContext.destination);
+
+    
+    
+  }
+
+  // --------------------------------------------------------------------
+  // ファイル処理
+  // --------------------------------------------------------------------
+  async function handleFile(file) {
+    if (!file) return;
+    if (!file.name.toLowerCase().endsWith('.spc')) {
+      setStatus('拡張子が .spc のファイルを選択してください', 'error');
+      return;
+    }
+
+    setStatus('ファイルを読み込み中...');
+    playBtn.disabled = true;
+    isLoaded = false;
+
+    try {
+      const buf = await file.arrayBuffer();
+      const parsed = parseSPC(buf);
+      currentParsed = parsed;
+
+      // UI更新: 曲情報表示
+      const tags = parsed.tags;
+      trackTitle.textContent = tags.songTitle || file.name;
+      trackGame.textContent = tags.gameTitle || '';
+      trackArtist.textContent = tags.artist ? ('作曲: ' + tags.artist) : '';
+      trackDumper.textContent = tags.dumperName ? ('Dump: ' + tags.dumperName) : '';
+      trackInfo.classList.add('visible');
+
+      setStatus('オーディオエンジンを初期化中...');
+      await ensureAudioContext();
+
+      if (audioContext.state === 'suspended') {
+        await audioContext.resume();
+      }
+
+     
+const player = new SPCPlayer();
+
+// ボイス情報のコールバック設定（任意）
+player.onVoiceInfo = (voices) => {
+  console.log(voices);
+};
+
+// SPCデータのロードと再生
+player.load(currentParsed);
+player.play();
+      setStatus('読み込み中...');
+    } catch (e) {
+      console.error(e);
+      setStatus('読み込みエラー: ' + e.message, 'error');
+    }
+  }
+
+  // --------------------------------------------------------------------
+  // 再生/停止トグル
+  // --------------------------------------------------------------------
+  async function togglePlay() {
+    if (!isLoaded || !workletNode) return;
+
+    if (audioContext.state === 'suspended') {
+      await audioContext.resume();
+    }
+
+    if (isPlaying) {
+      workletNode.port.postMessage({ type: 'stop' });
+      isPlaying = false;
+      playBtn.textContent = '▶ 再生';
+      playBtn.classList.remove('playing');
+      setStatus('停止しました');
+    } else {
+      workletNode.port.postMessage({ type: 'play' });
+      isPlaying = true;
+      playBtn.textContent = '⏸ 停止';
+      playBtn.classList.add('playing');
+      setStatus('再生中...', 'ok');
+    }
+  }
+
+  // --------------------------------------------------------------------
+  // イベントバインド
+  // --------------------------------------------------------------------
+  fileInput.addEventListener('change', (e) => {
+    const file = e.target.files && e.target.files[0];
+    handleFile(file);
+  });
+
+  dropzone.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    dropzone.classList.add('dragover');
+  });
+  dropzone.addEventListener('dragleave', () => {
+    dropzone.classList.remove('dragover');
+  });
+  dropzone.addEventListener('drop', (e) => {
+    e.preventDefault();
+    dropzone.classList.remove('dragover');
+    const file = e.dataTransfer.files && e.dataTransfer.files[0];
+    handleFile(file);
+  });
+
+  playBtn.addEventListener('click', togglePlay);
+
+  volumeSlider.addEventListener('input', () => {
+    const v = Number(volumeSlider.value);
+    volumeLabel.textContent = v + '%';
+    if (gainNode) {
+      gainNode.gain.value = v / 100;
+    }
+  });
+})();
+</script>
 </body>
 </html>
