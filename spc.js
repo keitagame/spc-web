@@ -1,4 +1,4 @@
-  // ============================================================================
+// ============================================================================
 // SPC Player - Main Thread Version (ScriptProcessorNode)
 // ============================================================================
 
@@ -655,7 +655,7 @@ class DSP {
         curBlockHeader: 0,
         keyOn: false,
         keyOff: false,
-        envMode: 'release',
+        envMode: 'off',
         envLevel: 0,
         loopFlag: false,
         endFlag: false,
@@ -679,7 +679,7 @@ class DSP {
       v.envLevel = 0;
       v.keyOn = false;
       v.keyOff = false;
-      v.envMode = 'release';
+      v.envMode = 'off';
       v.history = [0, 0];
       v.brrOffset = 16;
       v.endFlag = false;
@@ -798,7 +798,10 @@ class DSP {
 
     if (voice.envMode === 'release') {
       voice.envLevel -= 8;
-      if (voice.envLevel < 0) voice.envLevel = 0;
+      if (voice.envLevel <= 0) {
+        voice.envLevel = 0;
+        voice.envMode = 'off';
+      }
       return voice.envLevel;
     }
 
@@ -915,37 +918,11 @@ class DSP {
         voice.brrOffset = 0;
       }
 
-      // --- 修正前 (generateSample 内) ---
-// const idx = voice.brrOffset;
-// const s0 = voice.decodedBlock[idx];
-// const s1 = idx < 15 ? voice.decodedBlock[idx + 1] : s0;
-// const frac = (voice.pitchCounter & 0xfff) / 0x1000;
-// let sample = s0 + (s1 - s0) * frac;
-
-// --- 修正後 ---
-const idx = voice.brrOffset;
-const frac = (voice.pitchCounter >> 4) & 0xff; // 8bit精度
-
-// 直前・現在のブロックから4サンプルを取得
-const getSampleAt = (offset) => {
-  if (offset < 0) return voice.history[0]; // 過去の履歴
-  if (offset < 16) return voice.decodedBlock[offset];
-  return voice.decodedBlock[15];
-};
-
-const s0 = getSampleAt(idx - 1);
-const s1 = getSampleAt(idx);
-const s2 = getSampleAt(idx + 1);
-const s3 = getSampleAt(idx + 2);
-
-// ガウス補間テーブルの参照 (512要素)
-const g0 = this.gaussTable[255 - frac];
-const g1 = this.gaussTable[511 - frac];
-const g2 = this.gaussTable[256 + frac];
-const g3 = this.gaussTable[frac];
-// --- 修正箇所： / 2048 を削除 ---
-let sample = (s0 * g0 + s1 * g1 + s2 * g2 + s3 * g3);
-//let sample = (s0 * g0 + s1 * g1 + s2 * g2 + s3 * g3) / 2048;
+      const idx = voice.brrOffset;
+      const s0 = voice.decodedBlock[idx];
+      const s1 = idx < 15 ? voice.decodedBlock[idx + 1] : s0;
+      const frac = (voice.pitchCounter & 0xfff) / 0x1000;
+      let sample = s0 + (s1 - s0) * frac;
 
       if (this.non & bit) {
         sample = this.stepNoise();
@@ -988,8 +965,8 @@ let sample = (s0 * g0 + s1 * g1 + s2 * g2 + s3 * g3);
     let outL = (mixL * this.mvolL) / (128 * 8192);
     let outR = (mixR * this.mvolR) / (128 * 8192);
 
-    outL = Math.max(-1.0, Math.min(1.0, outL));
-outR = Math.max(-1.0, Math.min(1.0, outR));
+    outL = Math.tanh(outL);
+    outR = Math.tanh(outR);
 
     return [outL, outR];
   }
@@ -1087,8 +1064,7 @@ class SPCPlayer {
     this.audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
     this.engine = new SPCEngine();
     this.playing = false;
-this.historyL = [0, 0, 0, 0];
-this.historyR = [0, 0, 0, 0];
+
     this.resampleRatio = SDSP_SAMPLE_RATE / this.audioCtx.sampleRate;
     this.srcPos = 0;
     this.prevL = 0;
@@ -1127,10 +1103,12 @@ this.historyR = [0, 0, 0, 0];
   }
 
   _advanceDspSample() {
-  const [l, r] = this.engine.renderSample();
-  this.historyL.shift(); this.historyL.push(l);
-  this.historyR.shift(); this.historyR.push(r);
-}
+    this.prevL = this.nextL;
+    this.prevR = this.nextR;
+    const [l, r] = this.engine.renderSample();
+    this.nextL = l;
+    this.nextR = r;
+  }
 
   _getVoiceInfo() {
     const dsp = this.engine.dsp;
@@ -1167,26 +1145,17 @@ this.historyR = [0, 0, 0, 0];
       this.haveSample = true;
     }
 
-    // エルミート3次補間関数
-const hermite = (y0, y1, y2, y3, mu) => {
-  const m0 = (y2 - y0) * 0.5;
-  const m1 = (y3 - y1) * 0.5;
-  const a2 = 3 * (y2 - y1) - 2 * m0 - m1;
-  const a3 = -2 * (y2 - y1) + m0 + m1;
-  return ((a3 * mu + a2) * mu + m0) * mu + y1;
-};
+    for (let i = 0; i < n; i++) {
+      while (this.srcPos >= 1) {
+        this._advanceDspSample();
+        this.srcPos -= 1;
+      }
 
-for (let i = 0; i < n; i++) {
-  while (this.srcPos >= 1) {
-    this._advanceDspSample();
-    this.srcPos -= 1;
-  }
-
-  const frac = this.srcPos;
-  left[i] = hermite(this.historyL[0], this.historyL[1], this.historyL[2], this.historyL[3], frac);
-  right[i] = hermite(this.historyR[0], this.historyR[1], this.historyR[2], this.historyR[3], frac);
-  this.srcPos += this.resampleRatio;
-}
+      const frac = this.srcPos;
+      left[i] = this.prevL + (this.nextL - this.prevL) * frac;
+      right[i] = this.prevR + (this.nextR - this.prevR) * frac;
+      this.srcPos += this.resampleRatio;
+    }
 
     if (typeof this.onVoiceInfo === 'function') {
       this.onVoiceInfo(this._getVoiceInfo());
