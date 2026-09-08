@@ -298,26 +298,46 @@ function initVoiceKeyboards() {
   }
 }
 
-// 【差し替え】既存の updateVoiceInfo 関数をこちらに変更
-// updateVoiceInfo 内の鍵盤更新処理
 function updateVoiceInfo(voices) {
+  if (!voices || !Array.isArray(voices)) return;
+
+  // spc.js 側が 1〜8 (1始まり) で送っているか判定
+  const isOneBased = voices.some(v => (v && (v.voice === 8 || v.ch === 8 || v.id === 8)));
+
   voices.forEach((v, index) => {
-    const vIdx = v.voice !== undefined ? v.voice : index;
+    if (!v) return;
+
+    // ボイスIDの取得 (voice, ch, channel, id の順で検索)
+    let rawIdx = v.voice ?? v.ch ?? v.channel ?? v.id ?? index;
+    let vIdx = Number(rawIdx);
+
+    // 1始まりの場合は 1 引いて 0〜7 に揃える
+    if (isOneBased && vIdx >= 1) {
+      vIdx -= 1;
+    }
+
     const row = document.getElementById(`voice-row-${vIdx}`);
     if (!row) return;
 
-    row.querySelector(".v-status").textContent = v.active ? "ON" : "OFF";
-    row.querySelector(".v-vol-l").textContent = v.volumeL;
-    row.querySelector(".v-vol-r").textContent = v.volumeR;
-    row.querySelector(".v-note").textContent = v.active ? pitchToNote(v.pitch) : "-";
-    row.querySelector(".v-pitch").textContent = "0x" + v.pitch.toString(16).padStart(4, "0").toUpperCase();
+    // 値の反映
+    const active = !!v.active;
+    const volL = v.volumeL ?? v.volL ?? v.vol_l ?? "-";
+    const volR = v.volumeR ?? v.volR ?? v.vol_r ?? "-";
+    const pitch = typeof v.pitch === "number" ? v.pitch : 0;
 
+    row.querySelector(".v-status").textContent = active ? "ON" : "OFF";
+    row.querySelector(".v-vol-l").textContent = volL;
+    row.querySelector(".v-vol-r").textContent = volR;
+    row.querySelector(".v-note").textContent = active ? pitchToNote(pitch) : "-";
+    row.querySelector(".v-pitch").textContent = "0x" + pitch.toString(16).padStart(4, "0").toUpperCase();
+
+    // 鍵盤UIの更新
     const kb = row.querySelector(".mini-keyboard");
     if (kb) {
       kb.querySelectorAll(".mini-key.active").forEach(k => k.classList.remove("active"));
 
-      if (v.active) {
-        const midi = pitchToMidi(v.pitch);
+      if (active && pitch > 0) {
+        const midi = pitchToMidi(pitch);
         if (midi !== null) {
           const key = kb.querySelector(`.mini-key[data-note="${midi}"]`);
           if (key) {
@@ -328,7 +348,6 @@ function updateVoiceInfo(voices) {
     }
   });
 }
-
 // 初期化実行 (画面読み込み時に鍵盤列をあらかじめ生成)
 initVoiceKeyboards();
 
