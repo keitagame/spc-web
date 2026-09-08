@@ -5,14 +5,70 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>SPC</title>
 <style>
+  *{
+    color:white;
+    
+  }
+  img{
+image-rendering: pixelated; /* Chrome, Edge, Safari用 */
+  image-rendering: crisp-edges; /* Firefox用 */
+}
+  body{
+    background:black;
+  }
+/* ==========================================
+   各ボイス専用リアルタイム鍵盤UI用スタイル (追加部分)
+   ========================================== */
+.mini-keyboard {
+  display: inline-flex;
+  position: relative;
+  height: 36px;
+  background: #111;
+  padding: 2px 4px;
+  border-radius: 4px;
+  user-select: none;
+  vertical-align: middle;
+}
+
+.mini-key {
+  position: relative;
+  box-sizing: border-box;
+  border: 1px solid #333;
  
-</style>
+}
+
+.mini-key.white {
+  width: 8px;
+  height: 30px;
+  background: #eee;
+  z-index: 1;
+}
+
+.mini-key.black {
+  width: 5px;
+  height: 18px;
+  background: #222;
+  margin-left: -2.5px;
+  margin-right: -2.5px;
+  z-index: 2;
+  border-color: #000;
+}
+
+/* ボイスごとの発光カラー (VOICE 0〜7) */
+.v-0 .mini-key.active { background: #ff5252 !important;  z-index: 2; }
+.v-1 .mini-key.active { background: #ff9800 !important;  z-index: 2; }
+.v-2 .mini-key.active { background: #ffd600 !important;  z-index: 2; }
+.v-3 .mini-key.active { background: #4caf50 !important;  z-index: 2; }
+.v-4 .mini-key.active { background: #00bcd4 !important;  z-index: 2; }
+.v-5 .mini-key.active { background: #2196f3 !important;  z-index: 2; }
+.v-6 .mini-key.active { background: #9c27b0 !important;  z-index: 2; }
+.v-7 .mini-key.active { background: #e91e63 !important;  z-index: 2; }</style>
 </head>
 <body>
 
 <div class="card">
-  <h1>SPC Web</h1>
- 
+  <img width="200" src="NANDSP.png">
+ <br><br>
   <div class="dropzone" id="dropzone">
     <input type="file" id="fileInput" accept=".spc" />
    
@@ -28,18 +84,24 @@
   </div>
  <div id="voiceInfo">
     <table>
-        <thead>
-            <tr>
-                <th>VOICE</th>
-                <th>状態</th>
-                <th>音量 L</th>
-                <th>音量 R</th>
-                <th>音階</th>
-                <th>PITCH</th>
-            </tr>
-        </thead>
+        <!-- <th>PITCH</th> の下に <th>鍵盤</th> を追加 -->
+<thead>
+    <tr>
+        <th>VOICE</th>
+        <th>状態</th>
+        <th>音量 L</th>
+        <th>音量 R</th>
+        <th>音階</th>
+        <th>PITCH</th>
+        <th>鍵盤</th>
+    </tr>
+</thead>
         <tbody id="voiceTable"></tbody>
     </table>
+</div>
+<!-- 鍵盤UIコンテナ (追加部分) -->
+<div class="keyboard-container">
+  <div class="keyboard" id="keyboard"></div>
 </div>
  <canvas id="waveCanvas" width="600" height="120"></canvas>
 
@@ -182,18 +244,93 @@ function pitchToNote(pitch) {
 
     return `${name}${octave}`;
 }
-function updateVoiceInfo(voices) {
-    voiceTable.innerHTML = voices.map(v => `
-        <tr>
-            <td>${v.voice}</td>
-            <td>${v.active ? "ON" : "OFF"}</td>
-            <td>${v.volumeL}</td>
-            <td>${v.volumeR}</td>
-            <td>${v.active ? pitchToNote(v.pitch) : "-"}</td>
-            <td>0x${v.pitch.toString(16).padStart(4, "0").toUpperCase()}</td>
-        </tr>
-    `).join("");
+// ============================================================================
+// 各ボイス用リアルタイム鍵盤制御 (追加・変更部分)
+// ============================================================================
+const MIN_MIDI_NOTE = 24;
+const MAX_MIDI_NOTE = 108;
+const isBlackKey = [false, true, false, true, false, false, true, false, true, false, true, false];
+// ピッチからMIDIノート番号を算出 (0x1000 = C4 / MIDI 60)
+function pitchToMidi(pitch) {
+  if (!pitch || pitch <= 0) return null;
+  return Math.round(60 + 12 * Math.log2(pitch / 4096));
 }
+
+// 音階名テキスト変換の修正
+function pitchToNote(pitch) {
+  const midi = pitchToMidi(pitch);
+  if (midi === null) return "-";
+
+  const noteNames = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+  const octave = Math.floor(midi / 12) - 1;
+  const name = noteNames[((midi % 12) + 12) % 12];
+  return `${name}${octave}`;
+}
+
+// 初期化：8ボイス分のテーブル行と鍵盤DOMをあらかじめ作成
+function initVoiceKeyboards() {
+  const voiceTable = document.getElementById("voiceTable");
+  if (!voiceTable) return;
+  voiceTable.innerHTML = "";
+
+  for (let v = 0; v < 8; v++) {
+    const tr = document.createElement("tr");
+    tr.id = `voice-row-${v}`;
+
+    // 各ボイス専用の鍵盤HTML
+    let kbHtml = `<div class="mini-keyboard v-${v}">`;
+    for (let note = MIN_MIDI_NOTE; note <= MAX_MIDI_NOTE; note++) {
+      const isBlack = isBlackKey[note % 12];
+      kbHtml += `<div class="mini-key ${isBlack ? 'black' : 'white'}" data-note="${note}"></div>`;
+    }
+    kbHtml += `</div>`;
+
+    tr.innerHTML = `
+      <td>${v}</td>
+      <td class="v-status">-</td>
+      <td class="v-vol-l">-</td>
+      <td class="v-vol-r">-</td>
+      <td class="v-note">-</td>
+      <td class="v-pitch">-</td>
+      <td>${kbHtml}</td>
+    `;
+    voiceTable.appendChild(tr);
+  }
+}
+
+// 【差し替え】既存の updateVoiceInfo 関数をこちらに変更
+// updateVoiceInfo 内の鍵盤更新処理
+function updateVoiceInfo(voices) {
+  voices.forEach((v, index) => {
+    const vIdx = v.voice !== undefined ? v.voice : index;
+    const row = document.getElementById(`voice-row-${vIdx}`);
+    if (!row) return;
+
+    row.querySelector(".v-status").textContent = v.active ? "ON" : "OFF";
+    row.querySelector(".v-vol-l").textContent = v.volumeL;
+    row.querySelector(".v-vol-r").textContent = v.volumeR;
+    row.querySelector(".v-note").textContent = v.active ? pitchToNote(v.pitch) : "-";
+    row.querySelector(".v-pitch").textContent = "0x" + v.pitch.toString(16).padStart(4, "0").toUpperCase();
+
+    const kb = row.querySelector(".mini-keyboard");
+    if (kb) {
+      kb.querySelectorAll(".mini-key.active").forEach(k => k.classList.remove("active"));
+
+      if (v.active) {
+        const midi = pitchToMidi(v.pitch);
+        if (midi !== null) {
+          const key = kb.querySelector(`.mini-key[data-note="${midi}"]`);
+          if (key) {
+            key.classList.add("active");
+          }
+        }
+      }
+    }
+  });
+}
+
+// 初期化実行 (画面読み込み時に鍵盤列をあらかじめ生成)
+initVoiceKeyboards();
 
   let audioContext = null;
   let workletNode = null;
