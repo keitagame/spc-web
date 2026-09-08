@@ -278,7 +278,7 @@ const player = new SPCPlayer();
 
 // ボイス情報のコールバック設定（任意）
 player.onVoiceInfo = (voices) => {
-  console.log(voices);
+  updateVoiceInfo(voices);
 };
 
 // SPCデータのロードと再生
