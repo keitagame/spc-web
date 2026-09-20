@@ -468,18 +468,16 @@ class SPC700 {
       return 9;
     };
     T[0x9E] = function () {
-      let ya = (this.Y << 8) | this.A;
+      const ya = (this.Y << 8) | this.A;
       const x = this.X;
-      if (x === 0) {
-        this.A = 0xff; this.Y = 0xff;
-        this.flagV = 1; this.flagH = 1;
-        this.setNZ8(this.A);
-        return 12;
+      let quotient = 0xffff;
+      let remainder = ya & 0xff;
+      if (x !== 0) {
+        quotient = Math.floor(ya / x) & 0xffff;
+        remainder = ya % x;
       }
-      this.flagH = ((this.Y & 0xf) >= (x & 0xf)) ? 1 : 0;
-      const quotient = Math.floor(ya / x);
-      const remainder = ya % x;
       this.flagV = quotient > 0xff ? 1 : 0;
+      this.flagH = ((this.Y & 0xf) <= (x & 0xf)) ? 1 : 0;
       this.A = quotient & 0xff;
       this.Y = remainder & 0xff;
       this.setNZ8(this.A);
@@ -624,16 +622,47 @@ if (typeof module !== 'undefined') module.exports = { SPC700 };
 // ============================================================================
 const SDSP_RATE = 32000;
 
+// ---- 出力の耳あたり調整用パラメータ ---------------------------------------
+// OUTPUT_HEADROOM: 1より大きいほど全体の音量が下がり、tanhで潰れにくくなる。
+//   元は常時ピーク付近(0.975)で歪んでいたため余裕を持たせる。
+const OUTPUT_HEADROOM = 2.2;
+// ローパスのカットオフ(Hz)。低いほどまろやか、高いほど明るい。
+const LP_CUTOFF_HZ = 7500;
+const LP_ALPHA = 1 - Math.exp(-2 * Math.PI * LP_CUTOFF_HZ / SDSP_RATE);
+
+// 穏やかなソフトクリップ。小さい音はほぼそのまま、大きい音だけ滑らかに丸める。
+// tanhより「膝」がゆるやかで、常用しても歪み感が出にくい。
+function softClip(x) {
+  const t = 0.6;                       // ここまでは素通し
+  const ax = Math.abs(x);
+  if (ax <= t) return x;
+  const over = (ax - t) / (1 - t);     // 0以上
+  const y = t + (1 - t) * Math.tanh(over);
+  return x < 0 ? -y : y;
+}
+
+
 const COUNTER_RATES = [
   0, 2048, 1536, 1280, 1024, 768, 640, 512, 384, 320, 256, 192,
   160, 128, 96, 80, 64, 48, 40, 32, 24, 20, 16, 12, 10, 8, 6, 5, 4, 3, 2, 1
 ];
 
+// ガウス補間表(4タップ・512エントリ・4タップ合計 ≒ 2048)
+// 実機S-DSPのガウス補間と同じ性質: 線形補間より高域が丸くなり、
+// ジャリつき(エイリアシング)が減って耳に優しい音になる。
 function buildGaussTable() {
-  const table = new Float64Array(512);
-  for (let i = 0; i < 512; i++) {
-    const x = (i - 256) / 256;
-    table[i] = Math.exp(-3.0 * x * x);
+  const table = new Int32Array(512);
+  const sigma = 0.62;
+  const kernel = d => Math.exp(-(d * d) / (2 * sigma * sigma));
+  for (let i = 0; i < 256; i++) {
+    const f = i / 256;
+    const w = [kernel(1 + f), kernel(f), kernel(1 - f), kernel(2 - f)]; // 古→新
+    const sum = w[0] + w[1] + w[2] + w[3];
+    const n = w.map(v => (v / sum) * 2048);
+    table[255 - i] = Math.round(n[0]);
+    table[511 - i] = Math.round(n[1]);
+    table[256 + i] = Math.round(n[2]);
+    table[i]       = Math.round(n[3]);
   }
   return table;
 }
@@ -652,6 +681,8 @@ class DSP {
         pitchCounter: 0,
         history: [0, 0],
         decodedBlock: new Int16Array(16),
+        // Gauss補間用: 直近4サンプル(古→新)。ブロック境界をまたいでも連続になる
+        interp: new Float64Array(4),
         curBlockHeader: 0,
         keyOn: false,
         keyOff: false,
@@ -661,20 +692,43 @@ class DSP {
         endFlag: false,
         sampleAddr: 0,
         outSample: 0,
+        konDelay: 0,
       });
     }
 
     this.gaussTable = buildGaussTable();
-    this.echoBuffer = null;
     this.noiseLFSR = 0x4000;
     this.masterVolL = 0;
     this.masterVolR = 0;
+
+    // --- エコー(残響) ---
+    // 実機同様、エコーバッファはSPC RAM上(ESA/EDLで指定)に置く。
+    // 8タップFIRの履歴と書き込み位置を保持する。
+    this.echoPos = 0;
+    this.echoLen = 0;
+    this.firHistL = new Float64Array(8);
+    this.firHistR = new Float64Array(8);
+    this.firPos = 0;
+
+    // --- 出力段(耳に優しくするための後処理) ---
+    // DC除去(ハイパス ~ 8Hz)と、高域を穏やかに落とすローパス。
+    this.dcPrevInL = 0; this.dcPrevOutL = 0;
+    this.dcPrevInR = 0; this.dcPrevOutR = 0;
+    this.lpL = 0; this.lpR = 0;
   }
 
   reset() {
     this.regs.fill(0);
     this.regAddr = 0;
+    this._globalCounter = 0;
+    this._pendingKon = 0; // このサンプル期間中にKONへ書き込まれたビットの蓄積
+    this.echoPos = 0;
+    this.echoLen = 0;
+    this.firHistL.fill(0); this.firHistR.fill(0); this.firPos = 0;
+    this.dcPrevInL = this.dcPrevOutL = this.dcPrevInR = this.dcPrevOutR = 0;
+    this.lpL = this.lpR = 0;
     for (const v of this.voices) {
+      v.interp.fill(0);
       v.pitchCounter = 0;
       v.envLevel = 0;
       v.keyOn = false;
@@ -683,6 +737,7 @@ class DSP {
       v.history = [0, 0];
       v.brrOffset = 16;
       v.endFlag = false;
+      v._konLatched = false;
     }
   }
 
@@ -691,8 +746,13 @@ class DSP {
     addr &= 0x7f;
     val &= 0xff;
     if (addr === 0x7c) {
-      //this.regs[0x7c] = 0; // ENDXへの書き込みは値を問わず全ビットクリア
+      this.regs[0x7c] = 0; // ENDXへの書き込みは値を問わず全ビットクリア
       return;
+    }
+    if (addr === 0x4c) {
+      // KONへの書き込みは「新たに1になったビット」を確実に拾うため、
+      // 次のサンプル生成までのビットを蓄積しておく(見逃し防止)。
+      this._pendingKon = (this._pendingKon || 0) | val;
     }
     this.regs[addr] = val;
   }
@@ -719,6 +779,9 @@ class DSP {
   get evolL() { return this._s8(this.regs[0x2c]); }
   get evolR() { return this._s8(this.regs[0x3c]); }
   get efb() { return this._s8(this.regs[0x0d]); }
+  get esa() { return this.regs[0x6d]; }
+  get edl() { return this.regs[0x7d] & 0x0f; }
+  fir(i) { return this._s8(this.regs[(i << 4) | 0x0f]); }
 
   getSampleDirEntry(srcn) {
     const base = (this.dir << 8) + srcn * 4;
@@ -727,7 +790,7 @@ class DSP {
     return { start, loop };
   }
 
-  decodeBrrBlock(voice, addr) {
+  decodeBrrBlock(voice, addr, voiceIdx) {
     const header = this.ram[addr];
     const range = (header >> 4) & 0x0f;
     const filter = (header >> 2) & 0x03;
@@ -771,8 +834,8 @@ class DSP {
     voice.history[1] = h2;
     voice.loopFlag = loopBit === 1;
     voice.endFlag = endBit === 1;
-    if (endBit === 1) {
-      //this.regs[0x7c] |= (1 << voiceIdx); // 波形終了時にENDXビットを立てる
+    if (endBit === 1 && voiceIdx !== undefined) {
+      this.regs[0x7c] |= (1 << voiceIdx); // 波形終了時にENDXビットを立てる
     }
     return endBit === 1;
   }
@@ -871,8 +934,13 @@ class DSP {
     this._globalCounter = (this._globalCounter || 0) + 1;
 
     let mixL = 0, mixR = 0;
-    const konReg = this.kon;
+    let eMixL = 0, eMixR = 0; // EONが立っているボイスだけをエコーへ送る
+    // 通常のKONレジスタ値に加えて、この期間中に書き込まれたビットも
+    // 必ず拾う(CPUが同一サンプル期間内にKONへ複数回書き込んでも
+    // トリガーを取りこぼさないようにするため)。
+    const konReg = this.kon | (this._pendingKon || 0);
     const koffReg = this.koff;
+    this._pendingKon = 0;
 
     for (let i = 0; i < 8; i++) {
       const voice = this.voices[i];
@@ -896,6 +964,24 @@ class DSP {
         continue;
       }
 
+      if (voice.envMode === 'kon-delay') {
+        // KON検出直後の無音準備期間。ボイスは出力を持たないが、
+        // 実機同様に最初のBRRブロックのデコードだけ先行して行っておく。
+        if (voice.brrOffset >= 16) {
+          this.decodeBrrBlock(voice, voice.brrAddr, i);
+          // 補間履歴は「無音3つ + 先頭サンプル」で開始(立ち上がりのクリック防止)
+          voice.interp[0] = 0; voice.interp[1] = 0; voice.interp[2] = 0;
+          voice.interp[3] = voice.decodedBlock[0];
+          voice.brrOffset = 1;
+        }
+        voice.outSample = 0;
+        voice.konDelay--;
+        if (voice.konDelay <= 0) {
+          voice.envMode = 'attack';
+        }
+        continue;
+      }
+
       let p = this.pitch(i);
       if (i > 0 && (this.pmon & bit)) {
         const prevOut = this.voices[i - 1].outSample;
@@ -903,26 +989,17 @@ class DSP {
       }
       if (p > 0x3fff) p = 0x3fff;
 
-      if (voice.brrOffset >= 16) {
-        if (voice.endFlag) {
-          if (voice.loopFlag) {
-            const dirEntry = this.getSampleDirEntry(this.srcn(i));
-            voice.brrAddr = dirEntry.loop;
-          } else {
-            voice.envMode = 'off';
-            voice.envLevel = 0;
-            continue;
-          }
-        }
-        this.decodeBrrBlock(voice, voice.brrAddr);
-        voice.brrOffset = 0;
-      }
-
-      const idx = voice.brrOffset;
-      const s0 = voice.decodedBlock[idx];
-      const s1 = idx < 15 ? voice.decodedBlock[idx + 1] : s0;
-      const frac = (voice.pitchCounter & 0xfff) / 0x1000;
-      let sample = s0 + (s1 - s0) * frac;
+      // --- ガウス補間 -------------------------------------------------
+      // 直近4サンプル(voice.interp: 古→新)と、ピッチカウンタ下位ビットから
+      // 表を引いて補間する。線形補間より高域の折り返しが少なく、丸い音になる。
+      const gi = (voice.pitchCounter >> 4) & 0xff; // 0..255
+      const gt = this.gaussTable;
+      const ip = voice.interp;
+      let sample =
+        (gt[255 - gi] * ip[0] +
+         gt[511 - gi] * ip[1] +
+         gt[256 + gi] * ip[2] +
+         gt[gi]       * ip[3]) / 2048;
 
       if (this.non & bit) {
         sample = this.stepNoise();
@@ -937,52 +1014,136 @@ class DSP {
       const vr = this.volR(i) / 128;
       mixL += sample * vl;
       mixR += sample * vr;
+      if (this.eon & bit) {
+        // エコー送り(15bit相当へ揃える)
+        eMixL += sample * vl;
+        eMixR += sample * vr;
+      }
 
       voice.pitchCounter += p;
-      const advance = voice.pitchCounter >> 12;
+      let advance = voice.pitchCounter >> 12;
       voice.pitchCounter &= 0xfff;
-      voice.brrOffset += advance;
-      while (voice.brrOffset >= 16) {
-        if (voice.endFlag) {
-          if (voice.loopFlag) {
-            const dirEntry = this.getSampleDirEntry(this.srcn(i));
-            voice.brrAddr = dirEntry.loop;
+
+      // 1サンプル進むたびに、そのサンプルを補間履歴へ押し込む。
+      // これでBRRブロックの境界をまたいでも4タップが連続する。
+      while (advance-- > 0) {
+        if (voice.brrOffset >= 16) {
+          if (voice.endFlag) {
+            if (voice.loopFlag) {
+              const dirEntry = this.getSampleDirEntry(this.srcn(i));
+              voice.brrAddr = dirEntry.loop;
+            } else {
+              voice.envMode = 'off';
+              voice.envLevel = 0;
+              break;
+            }
           } else {
-            voice.envMode = 'off';
-            voice.envLevel = 0;
-            voice.brrOffset = 16;
-            break;
+            voice.brrAddr = (voice.brrAddr + 9) & 0xffff;
           }
-        } else {
-          voice.brrAddr = (voice.brrAddr + 9) & 0xffff;
+          this.decodeBrrBlock(voice, voice.brrAddr, i);
+          voice.brrOffset = 0;
         }
-        if (voice.envMode === 'off') break;
-        this.decodeBrrBlock(voice, voice.brrAddr);
-        voice.brrOffset -= 16;
+        const ip2 = voice.interp;
+        ip2[0] = ip2[1]; ip2[1] = ip2[2]; ip2[2] = ip2[3];
+        ip2[3] = voice.decodedBlock[voice.brrOffset];
+        voice.brrOffset++;
       }
     }
 //this.regs[0x4c] = 0;
-    let outL = (mixL * this.mvolL) / (128 * 8192);
-    let outR = (mixR * this.mvolR) / (128 * 8192);
+    // ---- エコー(残響) --------------------------------------------------
+    // 実機と同じく、エコーバッファはSPC RAM上(ESA*0x100 から EDL*2KB)。
+    // FLGのbit5(ECEN)が立っていなければ書き込みしない(=RAMを壊さない)。
+    // 響きが加わることで音の角が取れ、空間になじんで耳に優しくなる。
+    const echoLen = this.edl * 512;             // 単位: ステレオ1組=4byte, 2KB=512組
+    const echoOn = echoLen > 0;
+    let echoOutL = 0, echoOutR = 0;
+    if (echoOn) {
+      const ram = this.ram;
+      const base = ((this.esa << 8) + this.echoPos * 4) & 0xffff;
+      // RAMからエコー入力(16bit LE)を読む
+      let inL = (ram[base] | (ram[(base + 1) & 0xffff] << 8)); if (inL & 0x8000) inL -= 0x10000;
+      let inR = (ram[(base + 2) & 0xffff] | (ram[(base + 3) & 0xffff] << 8)); if (inR & 0x8000) inR -= 0x10000;
 
-    outL = Math.tanh(outL);
-    outR = Math.tanh(outR);
+      // 8タップFIR。履歴は「古→新」のリング。
+      const hl = this.firHistL, hr = this.firHistR, fp = this.firPos;
+      hl[fp] = inL / 2; hr[fp] = inR / 2;      // 履歴は 15bit 相当に揃える
+      let fl = 0, fr = 0;
+      for (let t = 0; t < 8; t++) {
+        const idx = (fp + 1 + t) & 7;           // t=0が最古, t=7が最新
+        const c = this.fir(t);
+        fl += hl[idx] * c; fr += hr[idx] * c;
+      }
+      this.firPos = (fp + 1) & 7;
+      fl /= 64; fr /= 64;   // 履歴が入力/2(15bit)なので、実機どおり >>6 相当
+      if (fl > 32767) fl = 32767; else if (fl < -32768) fl = -32768;
+      if (fr > 32767) fr = 32767; else if (fr < -32768) fr = -32768;
+      echoOutL = fl; echoOutR = fr;
+
+      // フィードバックを書き戻す(FLG bit5 = 1 なら書き込み禁止)
+      if (!(this.flg & 0x20)) {
+        const efb = this.efb / 128;
+        // mixのEONビット分だけをエコーへ送る(下で eMixL/R に集計済み)
+        let wl = eMixL + fl * efb;
+        let wr = eMixR + fr * efb;
+        // ブロック内は 16bit 整数に丸めて格納
+        wl = Math.max(-32768, Math.min(32767, Math.round(wl)));
+        wr = Math.max(-32768, Math.min(32767, Math.round(wr)));
+        ram[base]                 = wl & 0xff;
+        ram[(base + 1) & 0xffff]  = (wl >> 8) & 0xff;
+        ram[(base + 2) & 0xffff]  = wr & 0xff;
+        ram[(base + 3) & 0xffff]  = (wr >> 8) & 0xff;
+      }
+      this.echoPos = (this.echoPos + 1) % (echoLen);
+    } else {
+      this.echoPos = 0;
+    }
+
+    // ---- ミックス --------------------------------------------------------
+    // ドライ(ボイス) + ウェット(エコー)。音量は実機の /128 スケール。
+    // mix/echoOut はどちらも 16bit 相当のスケール。音量レジスタは /128 が実機の定義。
+    let outL = (mixL * this.mvolL + echoOutL * this.evolL) / (128 * 8192 * OUTPUT_HEADROOM);
+    let outR = (mixR * this.mvolR + echoOutR * this.evolR) / (128 * 8192 * OUTPUT_HEADROOM);
+
+    // ---- 出力の後処理(耳に優しくする) ----------------------------------
+    // 1) 穏やかなソフトクリップ: 歪ませずにピークだけ丸める
+    outL = softClip(outL);
+    outR = softClip(outR);
+
+    // 2) DC除去(ハイパス ~8Hz): 低域のボコボコしたオフセットやポップ音を防ぐ
+    {
+      const R_DC = 0.99843; // 1 - 2π*8/32000
+      const yl = outL - this.dcPrevInL + R_DC * this.dcPrevOutL;
+      this.dcPrevInL = outL; this.dcPrevOutL = yl; outL = yl;
+      const yr = outR - this.dcPrevInR + R_DC * this.dcPrevOutR;
+      this.dcPrevInR = outR; this.dcPrevOutR = yr; outR = yr;
+    }
+
+    // 3) 1極ローパス(約 7.5kHz): シャリシャリ/キンキンした高域を穏やかに落とす
+    {
+      this.lpL += LP_ALPHA * (outL - this.lpL); outL = this.lpL;
+      this.lpR += LP_ALPHA * (outR - this.lpR); outR = this.lpR;
+    }
 
     return [outL, outR];
   }
 
   _triggerKeyOn(voice, i) {
-   // this.regs[0x7c] &= ~(1 << i);
+    this.regs[0x7c] &= ~(1 << i); // KEY ON時にENDXビットをクリア
     const dirEntry = this.getSampleDirEntry(this.srcn(i));
     voice.brrAddr = dirEntry.start;
     voice.brrOffset = 16;
     voice.pitchCounter = 0;
     voice.history = [0, 0];
     voice.envLevel = 0;
-    voice.envMode = 'attack';
+    // 実機のS-DSPはKEY ON検出後、実際に音を出し始めるまで
+    // 数サンプル分の準備期間(BRRプリフェッチ・フィルタ履歴初期化)がある。
+    // この間 envMode は 'kon-delay' として無音を維持する。
+    voice.envMode = 'kon-delay';
+    voice.konDelay = 5;
     voice.keyOff = false;
     voice.endFlag = false;
     voice.loopFlag = false;
+    voice.outSample = 0;
   }
 }
 
@@ -1060,54 +1221,93 @@ class SPCEngine {
 const SDSP_SAMPLE_RATE = 32000;
 
 class SPCPlayer {
-  constructor(audioCtx) {
+  // audioCtx : 既存のAudioContext(省略時は内部で作成)
+  // destination : 出力先ノード(省略時は audioCtx.destination)。
+  //   index.html の gainNode を渡すと、音量スライダーが効くようになる。
+  constructor(audioCtx, destination) {
     this.audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    this.destination = destination || this.audioCtx.destination;
     this.engine = new SPCEngine();
     this.playing = false;
 
     this.resampleRatio = SDSP_SAMPLE_RATE / this.audioCtx.sampleRate;
     this.srcPos = 0;
-    this.prevL = 0;
-    this.prevR = 0;
-    this.nextL = 0;
-    this.nextR = 0;
+
+    // 3次補間(Catmull-Rom)用に、DSP出力の直近4サンプル(古→新)を保持
+    this.hL = new Float64Array(4);
+    this.hR = new Float64Array(4);
     this.haveSample = false;
 
-    // ボイス情報更新時のコールバック関数
-    this.onVoiceInfo = null;
+    // 再生開始/停止時のフェード(プチッというクリック音の防止)
+    this.fade = 0;             // 現在のフェードゲイン 0..1
+    this.fadeTarget = 0;       // 目標
+    this.fadeStep = 1 / (this.audioCtx.sampleRate * 0.05); // 約50msでフェード
 
-    // ScriptProcessorNode の生成 (4096バッファサイズ)
-    this.scriptNode = this.audioCtx.createScriptProcessor(4096, 0, 2);
+    // ボイス情報コールバック。オーディオ処理の外(描画タイミング)で呼ぶ。
+    this.onVoiceInfo = null;
+    this._voiceTimer = null;
+
+    // ScriptProcessorNode (8192: 少し大きめにして、処理落ちによるプチプチを防ぐ)
+    this.scriptNode = this.audioCtx.createScriptProcessor(8192, 0, 2);
     this.scriptNode.onaudioprocess = (e) => this._process(e);
+    this._connected = false;
   }
 
   load(parsed) {
     this.engine.loadSPC(parsed);
-    this.playing = true;
     this.srcPos = 0;
     this.haveSample = false;
-    this.prevL = this.prevR = this.nextL = this.nextR = 0;
+    this.hL.fill(0); this.hR.fill(0);
+    this.fade = 0;
   }
 
   play() {
     if (this.audioCtx.state === 'suspended') {
       this.audioCtx.resume();
     }
-    this.scriptNode.connect(this.audioCtx.destination);
+    if (!this._connected) {
+      this.scriptNode.connect(this.destination);
+      this._connected = true;
+    }
     this.playing = true;
+    this.fadeTarget = 1;
+    this._startVoiceTimer();
   }
 
   stop() {
-    this.playing = false;
-    this.scriptNode.disconnect();
+    // すぐ切らずにフェードアウトしてから停止する
+    this.fadeTarget = 0;
+    this._stopVoiceTimer();
+    setTimeout(() => {
+      if (this.fadeTarget === 0) {
+        this.playing = false;
+        if (this._connected) {
+          try { this.scriptNode.disconnect(); } catch (e) {}
+          this._connected = false;
+        }
+      }
+    }, 80);
+  }
+
+  // ボイス情報は ~30fps でメインスレッド側から取得(オーディオコールバック内では呼ばない)
+  _startVoiceTimer() {
+    if (this._voiceTimer) return;
+    this._voiceTimer = setInterval(() => {
+      if (typeof this.onVoiceInfo === 'function' && this.engine.loaded) {
+        this.onVoiceInfo(this._getVoiceInfo());
+      }
+    }, 33);
+  }
+  _stopVoiceTimer() {
+    if (this._voiceTimer) { clearInterval(this._voiceTimer); this._voiceTimer = null; }
   }
 
   _advanceDspSample() {
-    this.prevL = this.nextL;
-    this.prevR = this.nextR;
+    const hL = this.hL, hR = this.hR;
+    hL[0] = hL[1]; hL[1] = hL[2]; hL[2] = hL[3];
+    hR[0] = hR[1]; hR[1] = hR[2]; hR[2] = hR[3];
     const [l, r] = this.engine.renderSample();
-    this.nextL = l;
-    this.nextR = r;
+    hL[3] = l; hR[3] = r;
   }
 
   _getVoiceInfo() {
@@ -1127,6 +1327,14 @@ class SPCPlayer {
     return voices;
   }
 
+  // Catmull-Rom 3次補間: y0,y1,y2,y3 のうち y1-y2 の間を t(0..1) で補間
+  static _cubic(y0, y1, y2, y3, t) {
+    const a = -0.5 * y0 + 1.5 * y1 - 1.5 * y2 + 0.5 * y3;
+    const b =        y0 - 2.5 * y1 + 2.0 * y2 - 0.5 * y3;
+    const c = -0.5 * y0            + 0.5 * y2;
+    return ((a * t + b) * t + c) * t + y1;
+  }
+
   _process(e) {
     const output = e.outputBuffer;
     const left = output.getChannelData(0);
@@ -1140,26 +1348,36 @@ class SPCPlayer {
     }
 
     if (!this.haveSample) {
-      this._advanceDspSample();
-      this._advanceDspSample();
+      for (let k = 0; k < 4; k++) this._advanceDspSample();
       this.haveSample = true;
     }
+
+    const hL = this.hL, hR = this.hR;
+    const ratio = this.resampleRatio;
+    let fade = this.fade;
+    const fadeTarget = this.fadeTarget, fadeStep = this.fadeStep;
 
     for (let i = 0; i < n; i++) {
       while (this.srcPos >= 1) {
         this._advanceDspSample();
         this.srcPos -= 1;
       }
+      const t = this.srcPos;
+      // hL[1]-hL[2] の間を補間(hL[0],hL[3] は両隣)
+      let l = SPCPlayer._cubic(hL[0], hL[1], hL[2], hL[3], t);
+      let r = SPCPlayer._cubic(hR[0], hR[1], hR[2], hR[3], t);
 
-      const frac = this.srcPos;
-      left[i] = this.prevL + (this.nextL - this.prevL) * frac;
-      right[i] = this.prevR + (this.nextR - this.prevR) * frac;
-      this.srcPos += this.resampleRatio;
-    }
+      // フェード(イン/アウト)
+      if (fade < fadeTarget) { fade = Math.min(fadeTarget, fade + fadeStep); }
+      else if (fade > fadeTarget) { fade = Math.max(fadeTarget, fade - fadeStep); }
+      // 滑らかな曲線(コサイン)でゲインを掛ける
+      const g = 0.5 - 0.5 * Math.cos(Math.PI * fade);
+      left[i] = l * g;
+      right[i] = r * g;
 
-    if (typeof this.onVoiceInfo === 'function') {
-      this.onVoiceInfo(this._getVoiceInfo());
+      this.srcPos += ratio;
     }
+    this.fade = fade;
   }
 }
 

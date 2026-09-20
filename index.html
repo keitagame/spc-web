@@ -2,6 +2,7 @@
 <html lang="ja">
 <head>
 <meta charset="UTF-8">
+ <meta name="google-site-verification" content="ZZSxAUqnRnqPwPrbEKIs8b23T0Pga5JQ3vVt76KwMsc" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>SPC</title>
 <style>
@@ -127,6 +128,9 @@ image-rendering: pixelated; /* Chrome, Edge, Safari用 */
 <script src="spc.js">
 
 </script>
+.spcプレイヤー | spc700エミュレーター | WebSPCPlayer<br>
+スーパーファミコンのramダンプである.spcをweb上で再生出来ます。<br>
+正しく再生されない場合があります。
 <script>
   // ============================================================================
 // SPCファイルパーサー
@@ -352,6 +356,7 @@ function updateVoiceInfo(voices) {
 initVoiceKeyboards();
 
   let audioContext = null;
+  let player = null;
   let workletNode = null;
   let gainNode = null;
   let isPlaying = false;
@@ -371,20 +376,15 @@ initVoiceKeyboards();
   async function ensureAudioContext() {
     if (audioContext) return;
 
+// サンプルレートは指定せず、端末ネイティブのレートを使う。
+// (固定指定すると端末が別レートのとき、OS側で余計な再変換が入って音が荒れる)
+// SPCPlayer 側が 32kHz → ネイティブレート へ高品質補間して出力する。
 const audioOptions = {
-  // サンプルレートを 48000Hz (または 44100Hz) に固定
-  sampleRate: 48000, 
-  
-  // 音質最優先（再生の滑らかさ重視）に設定
-  latencyHint: 'playback' 
+  latencyHint: 'playback' // 音切れしにくさ優先
 };
 
-// レガシーブラウザ（フォールバック）対応を含めた初期化
 const AudioContextClass = window.AudioContext || window.webkitAudioContext;
 audioContext = new AudioContextClass(audioOptions);
-
-   
-  
 
     gainNode = audioContext.createGain();
     gainNode.gain.value = Number(volumeSlider.value) / 100;
@@ -429,18 +429,28 @@ audioContext = new AudioContextClass(audioOptions);
         await audioContext.resume();
       }
 
-     
-const player = new SPCPlayer();
 
-// ボイス情報のコールバック設定（任意）
-player.onVoiceInfo = (voices) => {
-  updateVoiceInfo(voices);
-};
+      // 前の曲が鳴っていたら、フェードアウトさせて止める(曲が重なって鳴るのを防ぐ)
+      if (player) {
+        player.stop();
+        player = null;
+      }
 
-// SPCデータのロードと再生
-player.load(currentParsed);
-player.play();
-      setStatus('読み込み中...');
+      // AudioContext と gainNode を渡す:
+      //  - 48kHzのContextをそのまま使う(別Contextを作らない)
+      //  - 出力を gainNode 経由にして、音量スライダーが効くようにする
+      player = new SPCPlayer(audioContext, gainNode);
+
+      // ボイス情報のコールバック(オーディオ処理の外で ~30fps で呼ばれる)
+      player.onVoiceInfo = (voices) => {
+        updateVoiceInfo(voices);
+      };
+
+      // SPCデータのロードと再生
+      player.load(currentParsed);
+      player.play();
+      isLoaded = true;
+      setStatus('再生中...', 'ok');
     } catch (e) {
       console.error(e);
       setStatus('読み込みエラー: ' + e.message, 'error');
