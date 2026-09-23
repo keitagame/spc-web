@@ -25,86 +25,110 @@ class SPC700 {
     this.flagZ = 0;
     this.flagC = 0;
 
-    this.ioPort = new Uint8Array(4);
-    this.ioIn = new Uint8Array(4);  // 追加：入力用ポート
-    this.ioOut = new Uint8Array(4); // 追加：出力用ポート
+    this.ioIn = new Uint8Array(4);  // 65816 → SPC ($F4-$F7 を SPC が読んだとき返る値)
+    this.ioOut = new Uint8Array(4); // SPC → 65816 ($F4-$F7 に SPC が書いた値)
     this.timerEnable = [0, 0, 0];
-    this.timerTarget = [0, 0, 0];
-    this.timerCounter = [0, 0, 0];
-    this.timerOut = [0, 0, 0];
+    this.timerTarget = [0, 0, 0];       // 生の値。8bit カウンタと == 比較(0 は 256 分周になる)
+    this.timerCounter = [0, 0, 0];      // 内部の分周カウンタ (target と比較)
+    this.timerOut = [0, 0, 0];          // 4bit 出力カウンタ ($FD-$FF)
+    this._tAccum = [0, 0, 0];           // CPUサイクルの蓄積
+    this.romEnable = true;              // $F1 bit7: $FFC0-$FFFF にブートROMを見せる
     this.cycles = 0;
+
+    // SPC700 ブートROM (64 bytes)
+    this.bootRom = new Uint8Array([
+      0xcd, 0xef, 0xbd, 0xe8, 0x00, 0xc6, 0x1d, 0xd0, 0xfc, 0x8f, 0xaa, 0xf4, 0x8f, 0xbb, 0xf5, 0x78,
+      0xcc, 0xf4, 0xd0, 0xfb, 0x2f, 0x19, 0xeb, 0xf4, 0xd0, 0xfc, 0x7e, 0xf4, 0xd0, 0x0b, 0xe4, 0xf5,
+      0xcb, 0xf4, 0xd7, 0x00, 0xfc, 0xd0, 0xf3, 0xab, 0x01, 0x10, 0xef, 0x7e, 0xf4, 0x10, 0xeb, 0xba,
+      0xf6, 0xda, 0x00, 0xba, 0xf4, 0xc4, 0xf4, 0xdd, 0x5d, 0xd0, 0xdb, 0x1f, 0x00, 0x00, 0xc0, 0xff
+    ]);
     
     this._buildOpTable();
   }
 
   read(addr) {
     addr &= 0xffff;
-    switch (addr) {
-      case 0xf2: return this.dsp.regAddr;
-      case 0xf3: return this.dsp.read(this.dsp.regAddr);
-      case 0xf4: case 0xf5: case 0xf6: case 0xf7:
-        return this.ioIn[addr - 0xf4];
-      case 0xfd: return this.readTimerOut(0);
-      case 0xfe: return this.readTimerOut(1);
-      case 0xff: return this.readTimerOut(2);
-      default:
-        return this.ram[addr];
+    if (addr >= 0xf0 && addr <= 0xff) {
+      switch (addr) {
+        case 0xf2: return this.dsp.regAddr;
+        case 0xf3: return this.dsp.read(this.dsp.regAddr & 0x7f);
+        case 0xf4: case 0xf5: case 0xf6: case 0xf7:
+          return this.ioIn[addr - 0xf4];
+        case 0xf8: case 0xf9:
+          return this.ram[addr];          // 普通のRAMとして読み書きできる
+        case 0xfd: return this.readTimerOut(0);
+        case 0xfe: return this.readTimerOut(1);
+        case 0xff: return this.readTimerOut(2);
+        default:
+          return 0;                       // $F0,$F1,$FA-$FC は読み出し不可(0)
+      }
     }
+    if (addr >= 0xffc0 && this.romEnable) {
+      return this.bootRom[addr & 0x3f];
+    }
+    return this.ram[addr];
   }
 
   write(addr, val) {
     addr &= 0xffff;
     val &= 0xff;
     switch (addr) {
-      case 0xf1:
-        if (val & 0x10) { this.ioPort[0] = 0; this.ioPort[1] = 0; }
-        if (val & 0x20) { this.ioPort[2] = 0; this.ioPort[3] = 0; }
+      case 0xf0:
+        break;                            // TEST レジスタ(未実装)
+      case 0xf1: {
+        // タイマーは 0→1 になった瞬間に内部/出力カウンタをリセット
         for (let t = 0; t < 3; t++) {
           const en = (val >> t) & 1;
           if (en && !this.timerEnable[t]) {
             this.timerCounter[t] = 0;
             this.timerOut[t] = 0;
+            this._tAccum[t] = 0;
           }
           this.timerEnable[t] = en;
         }
-        this.ram[addr] = val;
+        // 入力ポートのクリア: 65816 → SPC 方向(=SPCが読む側)の値を消す
+        if (val & 0x10) { this.ioIn[0] = 0; this.ioIn[1] = 0; }
+        if (val & 0x20) { this.ioIn[2] = 0; this.ioIn[3] = 0; }
+        this.romEnable = (val & 0x80) !== 0;
         break;
+      }
       case 0xf2:
         this.dsp.regAddr = val;
-        this.ram[addr] = val;
         break;
       case 0xf3:
-        this.dsp.write(this.dsp.regAddr, val);
-        this.ram[addr] = val;
+        // $F2 の bit7 が立っているときは書き込み不可(読み出し専用ミラー)
+        if (!(this.dsp.regAddr & 0x80)) this.dsp.write(this.dsp.regAddr & 0x7f, val);
         break;
       case 0xf4: case 0xf5: case 0xf6: case 0xf7:
         this.ioOut[addr - 0xf4] = val;
-        this.ram[addr] = val;
         break;
-      case 0xfa: this.timerTarget[0] = val === 0 ? 256 : val; this.ram[addr] = val; break;
-      case 0xfb: this.timerTarget[1] = val === 0 ? 256 : val; this.ram[addr] = val; break;
-      case 0xfc: this.timerTarget[2] = val === 0 ? 256 : val; this.ram[addr] = val; break;
-      default:
-        this.ram[addr] = val;
+      case 0xfa: this.timerTarget[0] = val; break;
+      case 0xfb: this.timerTarget[1] = val; break;
+      case 0xfc: this.timerTarget[2] = val; break;
     }
+    // 実機では書き込みは常にRAMにも届く(ROMが見えていても RAM へ書ける)
+    this.ram[addr] = val;
   }
 
   readTimerOut(t) {
     const v = this.timerOut[t] & 0x0f;
-    this.timerOut[t] = 0;
+    this.timerOut[t] = 0;                 // 読むとクリア
     return v;
   }
 
   tickTimers(cyc) {
-    this._tAccum = this._tAccum || [0, 0, 0];
+    // タイマー0/1: 8kHz (1.024MHz/128)、タイマー2: 64kHz (1.024MHz/16)
     const periods = [128, 128, 16];
     for (let t = 0; t < 3; t++) {
+      // 無効時もサイクルは蓄積しない(有効化時にリセットされる)
       if (!this.timerEnable[t]) continue;
       this._tAccum[t] += cyc;
       while (this._tAccum[t] >= periods[t]) {
         this._tAccum[t] -= periods[t];
-        this.timerCounter[t]++;
-        if (this.timerCounter[t] >= this.timerTarget[t]) {
+        this.timerCounter[t] = (this.timerCounter[t] + 1) & 0xff;
+        // 実機は「==」比較。target を飛び越した場合は 8bit を一周するまで出力しない。
+        // target=0 のときは 256 回目(8bit が 0 に戻った時)に一致する。
+        if (this.timerCounter[t] === this.timerTarget[t]) {
           this.timerCounter[t] = 0;
           this.timerOut[t] = (this.timerOut[t] + 1) & 0x0f;
         }
@@ -146,7 +170,14 @@ class SPC700 {
   fetch8() { const v = this.read(this.PC); this.PC = (this.PC + 1) & 0xffff; return v; }
   fetch16() { const lo = this.fetch8(); const hi = this.fetch8(); return (hi << 8) | lo; }
 
-  dp(off) { return (this.dpBase() + off) & 0xffff; }
+  // ダイレクトページのアドレス。オフセットは 8bit で、ページ内に収まる。
+  dp(off) { return (this.dpBase() | (off & 0xff)); }
+
+  // ダイレクトページ内の 16bit 読み書き。上位バイトは (off+1)&0xff = ページ内で折り返す
+  // ($FF の次は $00。$100 ではない)。
+  dpNext(a) { return (a & 0x100) | ((a + 1) & 0xff); }
+  rd16dp(a) { return this.read(a) | (this.read(this.dpNext(a)) << 8); }
+  wr16dp(a, w) { this.write(a, w & 0xff); this.write(this.dpNext(a), (w >> 8) & 0xff); }
 
   adc(a, b, carryIn) {
     const result = a + b + carryIn;
@@ -238,23 +269,23 @@ class SPC700 {
 
     T[0xC7] = function () {
       const ptr = this.dp((this.fetch8() + this.X) & 0xff);
-      const a = rd(ptr) | (rd((ptr + 1) & 0xffff) << 8);
+      const a = this.rd16dp(ptr);
       wr(a, this.A); return 7;
     };
     T[0xE7] = function () {
       const ptr = this.dp((this.fetch8() + this.X) & 0xff);
-      const a = rd(ptr) | (rd((ptr + 1) & 0xffff) << 8);
+      const a = this.rd16dp(ptr);
       this.A = this.setNZ8(rd(a)); return 6;
     };
     T[0xD7] = function () {
       const ptr = this.dp(this.fetch8());
-      const base = rd(ptr) | (rd((ptr + 1) & 0xffff) << 8);
+      const base = this.rd16dp(ptr);
       const a = (base + this.Y) & 0xffff;
       wr(a, this.A); return 7;
     };
     T[0xF7] = function () {
       const ptr = this.dp(this.fetch8());
-      const base = rd(ptr) | (rd((ptr + 1) & 0xffff) << 8);
+      const base = this.rd16dp(ptr);
       const a = (base + this.Y) & 0xffff;
       this.A = this.setNZ8(rd(a)); return 6;
     };
@@ -262,67 +293,73 @@ class SPC700 {
     T[0xFA] = function () { const src = this.dp(this.fetch8()); const dst = this.dp(this.fetch8()); wr(dst, rd(src)); return 5; };
     T[0x8F] = function () { const v = this.fetch8(); const a = this.dp(this.fetch8()); wr(a, v); return 5; };
 
+    // ---- 16bit 命令(すべてダイレクトページ内で折り返す) ----
+    // MOVW YA,dp
     T[0xBA] = function () {
       const a = this.dp(this.fetch8());
-      const lo = rd(a); const hi = rd((a + 1) & 0xffff);
+      const lo = rd(a); const hi = rd(this.dpNext(a));
       this.A = lo; this.Y = hi;
-      const w = (hi << 8) | lo;
-      this.flagZ = w === 0 ? 1 : 0;
+      this.flagZ = (lo | hi) === 0 ? 1 : 0;
       this.flagN = (hi & 0x80) ? 1 : 0;
       return 5;
     };
+    // MOVW dp,YA  (実機: 下位バイトを書く前にダミーリードがある)
     T[0xDA] = function () {
       const a = this.dp(this.fetch8());
-      wr(a, this.A); wr((a + 1) & 0xffff, this.Y);
+      rd(a);
+      wr(a, this.A); wr(this.dpNext(a), this.Y);
       return 5;
     };
+    // INCW dp
     T[0x3A] = function () {
       const a = this.dp(this.fetch8());
-      let w = (rd(a) | (rd((a + 1) & 0xffff) << 8));
-      w = (w + 1) & 0xffff;
-      wr(a, w & 0xff); wr((a + 1) & 0xffff, (w >> 8) & 0xff);
+      const w = (this.rd16dp(a) + 1) & 0xffff;
+      this.wr16dp(a, w);
       this.flagZ = w === 0 ? 1 : 0; this.flagN = (w & 0x8000) ? 1 : 0;
       return 6;
     };
+    // DECW dp
     T[0x1A] = function () {
       const a = this.dp(this.fetch8());
-      let w = (rd(a) | (rd((a + 1) & 0xffff) << 8));
-      w = (w - 1) & 0xffff;
-      wr(a, w & 0xff); wr((a + 1) & 0xffff, (w >> 8) & 0xff);
+      const w = (this.rd16dp(a) - 1) & 0xffff;
+      this.wr16dp(a, w);
       this.flagZ = w === 0 ? 1 : 0; this.flagN = (w & 0x8000) ? 1 : 0;
       return 6;
     };
+    // ADDW YA,dp   (C は最初のバイトの繰り上がりを含めた 16bit 加算。H は bit11 からの繰り上がり)
     T[0x7A] = function () {
       const a = this.dp(this.fetch8());
       const ya = (this.Y << 8) | this.A;
-      const m = (rd(a) | (rd((a + 1) & 0xffff) << 8));
+      const m = this.rd16dp(a);
       const result = ya + m;
-      this.flagC = result > 0xffff ? 1 : 0;
       const r16 = result & 0xffff;
+      this.flagC = result > 0xffff ? 1 : 0;
       this.flagV = (~(ya ^ m) & (ya ^ r16) & 0x8000) ? 1 : 0;
       this.flagH = (((ya & 0xfff) + (m & 0xfff)) > 0xfff) ? 1 : 0;
       this.Y = (r16 >> 8) & 0xff; this.A = r16 & 0xff;
       this.flagZ = r16 === 0 ? 1 : 0; this.flagN = (r16 & 0x8000) ? 1 : 0;
       return 5;
     };
+    // SUBW YA,dp
     T[0x9A] = function () {
       const a = this.dp(this.fetch8());
       const ya = (this.Y << 8) | this.A;
-      const m = (rd(a) | (rd((a + 1) & 0xffff) << 8));
+      const m = this.rd16dp(a);
       const mInv = (~m) & 0xffff;
       const result = ya + mInv + 1;
-      this.flagC = result > 0xffff ? 1 : 0;
       const r16 = result & 0xffff;
+      this.flagC = result > 0xffff ? 1 : 0;
       this.flagV = (~(ya ^ mInv) & (ya ^ r16) & 0x8000) ? 1 : 0;
       this.flagH = (((ya & 0xfff) + (mInv & 0xfff) + 1) > 0xfff) ? 1 : 0;
       this.Y = (r16 >> 8) & 0xff; this.A = r16 & 0xff;
       this.flagZ = r16 === 0 ? 1 : 0; this.flagN = (r16 & 0x8000) ? 1 : 0;
       return 5;
     };
+    // CMPW YA,dp
     T[0x5A] = function () {
       const a = this.dp(this.fetch8());
       const ya = (this.Y << 8) | this.A;
-      const m = (rd(a) | (rd((a + 1) & 0xffff) << 8));
+      const m = this.rd16dp(a);
       const result = (ya - m) & 0xffff;
       this.flagC = ya >= m ? 1 : 0;
       this.flagZ = result === 0 ? 1 : 0;
@@ -378,19 +415,19 @@ class SPC700 {
     T[0x86] = function () { const v = rd(this.dp(this.X)); this.A = this.adc(this.A, v, this.flagC); return 3; };
     T[0xA6] = function () { const v = rd(this.dp(this.X)); this.A = this.sbc(this.A, v, this.flagC); return 3; };
 
-    T[0x07] = function () { const ptr = this.dp((this.fetch8() + this.X) & 0xff); const a = rd(ptr) | (rd((ptr+1)&0xffff)<<8); const v = rd(a); this.A = this.setNZ8(this.A | v); return 6; };
-    T[0x27] = function () { const ptr = this.dp((this.fetch8() + this.X) & 0xff); const a = rd(ptr) | (rd((ptr+1)&0xffff)<<8); const v = rd(a); this.A = this.setNZ8(this.A & v); return 6; };
-    T[0x47] = function () { const ptr = this.dp((this.fetch8() + this.X) & 0xff); const a = rd(ptr) | (rd((ptr+1)&0xffff)<<8); const v = rd(a); this.A = this.setNZ8(this.A ^ v); return 6; };
-    T[0x67] = function () { const ptr = this.dp((this.fetch8() + this.X) & 0xff); const a = rd(ptr) | (rd((ptr+1)&0xffff)<<8); const v = rd(a); this.flagC = this.A >= v ? 1 : 0; this.setNZ8((this.A - v) & 0x1ff); return 6; };
-    T[0x87] = function () { const ptr = this.dp((this.fetch8() + this.X) & 0xff); const a = rd(ptr) | (rd((ptr+1)&0xffff)<<8); const v = rd(a); this.A = this.adc(this.A, v, this.flagC); return 6; };
-    T[0xA7] = function () { const ptr = this.dp((this.fetch8() + this.X) & 0xff); const a = rd(ptr) | (rd((ptr+1)&0xffff)<<8); const v = rd(a); this.A = this.sbc(this.A, v, this.flagC); return 6; };
+    T[0x07] = function () { const ptr = this.dp((this.fetch8() + this.X) & 0xff); const a = this.rd16dp(ptr); const v = rd(a); this.A = this.setNZ8(this.A | v); return 6; };
+    T[0x27] = function () { const ptr = this.dp((this.fetch8() + this.X) & 0xff); const a = this.rd16dp(ptr); const v = rd(a); this.A = this.setNZ8(this.A & v); return 6; };
+    T[0x47] = function () { const ptr = this.dp((this.fetch8() + this.X) & 0xff); const a = this.rd16dp(ptr); const v = rd(a); this.A = this.setNZ8(this.A ^ v); return 6; };
+    T[0x67] = function () { const ptr = this.dp((this.fetch8() + this.X) & 0xff); const a = this.rd16dp(ptr); const v = rd(a); this.flagC = this.A >= v ? 1 : 0; this.setNZ8((this.A - v) & 0x1ff); return 6; };
+    T[0x87] = function () { const ptr = this.dp((this.fetch8() + this.X) & 0xff); const a = this.rd16dp(ptr); const v = rd(a); this.A = this.adc(this.A, v, this.flagC); return 6; };
+    T[0xA7] = function () { const ptr = this.dp((this.fetch8() + this.X) & 0xff); const a = this.rd16dp(ptr); const v = rd(a); this.A = this.sbc(this.A, v, this.flagC); return 6; };
 
-    T[0x17] = function () { const ptr = this.dp(this.fetch8()); const base = rd(ptr) | (rd((ptr+1)&0xffff)<<8); const v = rd((base+this.Y)&0xffff); this.A = this.setNZ8(this.A | v); return 6; };
-    T[0x37] = function () { const ptr = this.dp(this.fetch8()); const base = rd(ptr) | (rd((ptr+1)&0xffff)<<8); const v = rd((base+this.Y)&0xffff); this.A = this.setNZ8(this.A & v); return 6; };
-    T[0x57] = function () { const ptr = this.dp(this.fetch8()); const base = rd(ptr) | (rd((ptr+1)&0xffff)<<8); const v = rd((base+this.Y)&0xffff); this.A = this.setNZ8(this.A ^ v); return 6; };
-    T[0x77] = function () { const ptr = this.dp(this.fetch8()); const base = rd(ptr) | (rd((ptr+1)&0xffff)<<8); const v = rd((base+this.Y)&0xffff); this.flagC = this.A >= v ? 1 : 0; this.setNZ8((this.A - v) & 0x1ff); return 6; };
-    T[0x97] = function () { const ptr = this.dp(this.fetch8()); const base = rd(ptr) | (rd((ptr+1)&0xffff)<<8); const v = rd((base+this.Y)&0xffff); this.A = this.adc(this.A, v, this.flagC); return 6; };
-    T[0xB7] = function () { const ptr = this.dp(this.fetch8()); const base = rd(ptr) | (rd((ptr+1)&0xffff)<<8); const v = rd((base+this.Y)&0xffff); this.A = this.sbc(this.A, v, this.flagC); return 6; };
+    T[0x17] = function () { const ptr = this.dp(this.fetch8()); const base = this.rd16dp(ptr); const v = rd((base+this.Y)&0xffff); this.A = this.setNZ8(this.A | v); return 6; };
+    T[0x37] = function () { const ptr = this.dp(this.fetch8()); const base = this.rd16dp(ptr); const v = rd((base+this.Y)&0xffff); this.A = this.setNZ8(this.A & v); return 6; };
+    T[0x57] = function () { const ptr = this.dp(this.fetch8()); const base = this.rd16dp(ptr); const v = rd((base+this.Y)&0xffff); this.A = this.setNZ8(this.A ^ v); return 6; };
+    T[0x77] = function () { const ptr = this.dp(this.fetch8()); const base = this.rd16dp(ptr); const v = rd((base+this.Y)&0xffff); this.flagC = this.A >= v ? 1 : 0; this.setNZ8((this.A - v) & 0x1ff); return 6; };
+    T[0x97] = function () { const ptr = this.dp(this.fetch8()); const base = this.rd16dp(ptr); const v = rd((base+this.Y)&0xffff); this.A = this.adc(this.A, v, this.flagC); return 6; };
+    T[0xB7] = function () { const ptr = this.dp(this.fetch8()); const base = this.rd16dp(ptr); const v = rd((base+this.Y)&0xffff); this.A = this.sbc(this.A, v, this.flagC); return 6; };
 
     T[0x09] = function () { const src = this.dp(this.fetch8()); const dst = this.dp(this.fetch8()); wr(dst, this.setNZ8(rd(dst) | rd(src))); return 6; };
     T[0x29] = function () { const src = this.dp(this.fetch8()); const dst = this.dp(this.fetch8()); wr(dst, this.setNZ8(rd(dst) & rd(src))); return 6; };
@@ -467,19 +504,22 @@ class SPC700 {
       this.setNZ8(this.Y);
       return 9;
     };
+    // DIV YA,X  (実機準拠: bsnes/higan と同じ式。商が 9bit を超える場合の特殊結果も再現)
     T[0x9E] = function () {
       const ya = (this.Y << 8) | this.A;
       const x = this.X;
-      let quotient = 0xffff;
-      let remainder = ya & 0xff;
-      if (x !== 0) {
-        quotient = Math.floor(ya / x) & 0xffff;
-        remainder = ya % x;
+      this.flagH = ((this.Y & 0xf) >= (x & 0xf)) ? 1 : 0;   // (X&15) <= (Y&15)
+      this.flagV = (this.Y >= x) ? 1 : 0;
+      if (this.Y < (x << 1)) {
+        // 通常の除算 (x=0 の場合 Y<0 は偽なので下の式へ入る)
+        this.A = Math.floor(ya / x) & 0xff;
+        this.Y = (ya % x) & 0xff;
+      } else {
+        // オーバーフロー時の実機挙動
+        const d = 256 - x;
+        this.A = (255 - Math.floor((ya - (x << 9)) / d)) & 0xff;
+        this.Y = (x + ((ya - (x << 9)) % d)) & 0xff;
       }
-      this.flagV = quotient > 0xff ? 1 : 0;
-      this.flagH = ((this.Y & 0xf) <= (x & 0xf)) ? 1 : 0;
-      this.A = quotient & 0xff;
-      this.Y = remainder & 0xff;
       this.setNZ8(this.A);
       return 12;
     };
@@ -505,8 +545,8 @@ class SPC700 {
     T[0x20] = function () { this.flagP = 0; return 2; };
     T[0x40] = function () { this.flagP = 1; return 2; };
     T[0xE0] = function () { this.flagV = 0; this.flagH = 0; return 2; };
-    T[0xA0] = function () { this.flagI = 1; return 3; };
-    T[0xC0] = function () { this.flagI = 0; return 3; };
+    T[0xA0] = function () { this.flagI = 1; return 2; };
+    T[0xC0] = function () { this.flagI = 0; return 2; };
 
     T[0x2D] = function () { this.push8(this.A); return 4; };
     T[0x4D] = function () { this.push8(this.X); return 4; };
@@ -575,8 +615,8 @@ class SPC700 {
       return 8;
     };
 
-    T[0xEF] = function () { this._stopped = true; return 3; };
-    T[0xFF] = function () { this._stopped = true; return 3; };
+    T[0xEF] = function () { this.PC = (this.PC - 1) & 0xffff; return 3; };   // SLEEP
+    T[0xFF] = function () { this.PC = (this.PC - 1) & 0xffff; return 3; };   // STOP
 
     T[0xAA] = function () {
       const w = this.fetch16(); const addr = w & 0x1fff; const bit = (w >> 13) & 7;
@@ -623,11 +663,12 @@ if (typeof module !== 'undefined') module.exports = { SPC700 };
 const SDSP_RATE = 32000;
 
 // ---- 出力の耳あたり調整用パラメータ ---------------------------------------
-// OUTPUT_HEADROOM: 1より大きいほど全体の音量が下がり、tanhで潰れにくくなる。
-//   元は常時ピーク付近(0.975)で歪んでいたため余裕を持たせる。
-const OUTPUT_HEADROOM = 2.2;
+// OUTPUT_HEADROOM: 1より大きいほど全体の音量が下がり、softClipで潰れにくくなる。
+//   ミックスを実機と同じ 16bit 整数スケール(±32768 = ±1.0)に揃えたので、
+//   1.0 で実機と同じ音量。大音量の曲でピークが気になる場合のみ 1 より大きくする。
+const OUTPUT_HEADROOM = 1.0;
 // ローパスのカットオフ(Hz)。低いほどまろやか、高いほど明るい。
-const LP_CUTOFF_HZ = 7500;
+const LP_CUTOFF_HZ = 6000;
 const LP_ALPHA = 1 - Math.exp(-2 * Math.PI * LP_CUTOFF_HZ / SDSP_RATE);
 
 // 穏やかなソフトクリップ。小さい音はほぼそのまま、大きい音だけ滑らかに丸める。
@@ -642,30 +683,51 @@ function softClip(x) {
 }
 
 
+// 実機のレートカウンタ用オフセット(bsnes/higan: counterOffset)
+const COUNTER_OFFSETS = [
+  0, 0, 1040, 536, 0, 1040, 536, 0, 1040, 536, 0, 1040, 536, 0, 1040, 536,
+  0, 1040, 536, 0, 1040, 536, 0, 1040, 536, 0, 1040, 536, 0, 1040, 0, 0
+];
 const COUNTER_RATES = [
   0, 2048, 1536, 1280, 1024, 768, 640, 512, 384, 320, 256, 192,
   160, 128, 96, 80, 64, 48, 40, 32, 24, 20, 16, 12, 10, 8, 6, 5, 4, 3, 2, 1
 ];
 
-// ガウス補間表(4タップ・512エントリ・4タップ合計 ≒ 2048)
-// 実機S-DSPのガウス補間と同じ性質: 線形補間より高域が丸くなり、
-// ジャリつき(エイリアシング)が減って耳に優しい音になる。
-function buildGaussTable() {
-  const table = new Int32Array(512);
-  const sigma = 0.62;
-  const kernel = d => Math.exp(-(d * d) / (2 * sigma * sigma));
-  for (let i = 0; i < 256; i++) {
-    const f = i / 256;
-    const w = [kernel(1 + f), kernel(f), kernel(1 - f), kernel(2 - f)]; // 古→新
-    const sum = w[0] + w[1] + w[2] + w[3];
-    const n = w.map(v => (v / sum) * 2048);
-    table[255 - i] = Math.round(n[0]);
-    table[511 - i] = Math.round(n[1]);
-    table[256 + i] = Math.round(n[2]);
-    table[i]       = Math.round(n[3]);
-  }
-  return table;
-}
+// 実機S-DSPのガウス補間表 (512エントリ, fullsnes より)。4タップ合計は ≒ 0x800。
+const GAUSS_TABLE = new Int16Array([
+  0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000,
+  0x001, 0x001, 0x001, 0x001, 0x001, 0x001, 0x001, 0x001, 0x001, 0x001, 0x001, 0x002, 0x002, 0x002, 0x002, 0x002,
+  0x002, 0x002, 0x003, 0x003, 0x003, 0x003, 0x003, 0x004, 0x004, 0x004, 0x004, 0x004, 0x005, 0x005, 0x005, 0x005,
+  0x006, 0x006, 0x006, 0x006, 0x007, 0x007, 0x007, 0x008, 0x008, 0x008, 0x009, 0x009, 0x009, 0x00A, 0x00A, 0x00A,
+  0x00B, 0x00B, 0x00B, 0x00C, 0x00C, 0x00D, 0x00D, 0x00E, 0x00E, 0x00F, 0x00F, 0x00F, 0x010, 0x010, 0x011, 0x011,
+  0x012, 0x013, 0x013, 0x014, 0x014, 0x015, 0x015, 0x016, 0x017, 0x017, 0x018, 0x018, 0x019, 0x01A, 0x01B, 0x01B,
+  0x01C, 0x01D, 0x01D, 0x01E, 0x01F, 0x020, 0x020, 0x021, 0x022, 0x023, 0x024, 0x024, 0x025, 0x026, 0x027, 0x028,
+  0x029, 0x02A, 0x02B, 0x02C, 0x02D, 0x02E, 0x02F, 0x030, 0x031, 0x032, 0x033, 0x034, 0x035, 0x036, 0x037, 0x038,
+  0x03A, 0x03B, 0x03C, 0x03D, 0x03E, 0x040, 0x041, 0x042, 0x043, 0x045, 0x046, 0x047, 0x049, 0x04A, 0x04C, 0x04D,
+  0x04E, 0x050, 0x051, 0x053, 0x054, 0x056, 0x057, 0x059, 0x05A, 0x05C, 0x05E, 0x05F, 0x061, 0x063, 0x064, 0x066,
+  0x068, 0x06A, 0x06B, 0x06D, 0x06F, 0x071, 0x073, 0x075, 0x076, 0x078, 0x07A, 0x07C, 0x07E, 0x080, 0x082, 0x084,
+  0x086, 0x089, 0x08B, 0x08D, 0x08F, 0x091, 0x093, 0x096, 0x098, 0x09A, 0x09C, 0x09F, 0x0A1, 0x0A3, 0x0A6, 0x0A8,
+  0x0AB, 0x0AD, 0x0AF, 0x0B2, 0x0B4, 0x0B7, 0x0BA, 0x0BC, 0x0BF, 0x0C1, 0x0C4, 0x0C7, 0x0C9, 0x0CC, 0x0CF, 0x0D2,
+  0x0D4, 0x0D7, 0x0DA, 0x0DD, 0x0E0, 0x0E3, 0x0E6, 0x0E9, 0x0EC, 0x0EF, 0x0F2, 0x0F5, 0x0F8, 0x0FB, 0x0FE, 0x101,
+  0x104, 0x107, 0x10B, 0x10E, 0x111, 0x114, 0x118, 0x11B, 0x11E, 0x122, 0x125, 0x129, 0x12C, 0x130, 0x133, 0x137,
+  0x13A, 0x13E, 0x141, 0x145, 0x148, 0x14C, 0x150, 0x153, 0x157, 0x15B, 0x15F, 0x162, 0x166, 0x16A, 0x16E, 0x172,
+  0x176, 0x17A, 0x17D, 0x181, 0x185, 0x189, 0x18D, 0x191, 0x195, 0x19A, 0x19E, 0x1A2, 0x1A6, 0x1AA, 0x1AE, 0x1B2,
+  0x1B7, 0x1BB, 0x1BF, 0x1C3, 0x1C8, 0x1CC, 0x1D0, 0x1D5, 0x1D9, 0x1DD, 0x1E2, 0x1E6, 0x1EB, 0x1EF, 0x1F3, 0x1F8,
+  0x1FC, 0x201, 0x205, 0x20A, 0x20F, 0x213, 0x218, 0x21C, 0x221, 0x226, 0x22A, 0x22F, 0x233, 0x238, 0x23D, 0x241,
+  0x246, 0x24B, 0x250, 0x254, 0x259, 0x25E, 0x263, 0x267, 0x26C, 0x271, 0x276, 0x27B, 0x280, 0x284, 0x289, 0x28E,
+  0x293, 0x298, 0x29D, 0x2A2, 0x2A6, 0x2AB, 0x2B0, 0x2B5, 0x2BA, 0x2BF, 0x2C4, 0x2C9, 0x2CE, 0x2D3, 0x2D8, 0x2DC,
+  0x2E1, 0x2E6, 0x2EB, 0x2F0, 0x2F5, 0x2FA, 0x2FF, 0x304, 0x309, 0x30E, 0x313, 0x318, 0x31D, 0x322, 0x326, 0x32B,
+  0x330, 0x335, 0x33A, 0x33F, 0x344, 0x349, 0x34E, 0x353, 0x357, 0x35C, 0x361, 0x366, 0x36B, 0x370, 0x374, 0x379,
+  0x37E, 0x383, 0x388, 0x38C, 0x391, 0x396, 0x39B, 0x39F, 0x3A4, 0x3A9, 0x3AD, 0x3B2, 0x3B7, 0x3BB, 0x3C0, 0x3C5,
+  0x3C9, 0x3CE, 0x3D2, 0x3D7, 0x3DC, 0x3E0, 0x3E5, 0x3E9, 0x3ED, 0x3F2, 0x3F6, 0x3FB, 0x3FF, 0x403, 0x408, 0x40C,
+  0x410, 0x415, 0x419, 0x41D, 0x421, 0x425, 0x42A, 0x42E, 0x432, 0x436, 0x43A, 0x43E, 0x442, 0x446, 0x44A, 0x44E,
+  0x452, 0x455, 0x459, 0x45D, 0x461, 0x465, 0x468, 0x46C, 0x470, 0x473, 0x477, 0x47A, 0x47E, 0x481, 0x485, 0x488,
+  0x48C, 0x48F, 0x492, 0x496, 0x499, 0x49C, 0x49F, 0x4A2, 0x4A6, 0x4A9, 0x4AC, 0x4AF, 0x4B2, 0x4B5, 0x4B7, 0x4BA,
+  0x4BD, 0x4C0, 0x4C3, 0x4C5, 0x4C8, 0x4CB, 0x4CD, 0x4D0, 0x4D2, 0x4D5, 0x4D7, 0x4D9, 0x4DC, 0x4DE, 0x4E0, 0x4E3,
+  0x4E5, 0x4E7, 0x4E9, 0x4EB, 0x4ED, 0x4EF, 0x4F1, 0x4F3, 0x4F5, 0x4F6, 0x4F8, 0x4FA, 0x4FB, 0x4FD, 0x4FF, 0x500,
+  0x502, 0x503, 0x504, 0x506, 0x507, 0x508, 0x50A, 0x50B, 0x50C, 0x50D, 0x50E, 0x50F, 0x510, 0x511, 0x511, 0x512,
+  0x513, 0x514, 0x514, 0x515, 0x516, 0x516, 0x517, 0x517, 0x517, 0x518, 0x518, 0x518, 0x518, 0x518, 0x519, 0x519,
+]);
 
 class DSP {
   constructor(ram) {
@@ -696,7 +758,7 @@ class DSP {
       });
     }
 
-    this.gaussTable = buildGaussTable();
+    this.gaussTable = GAUSS_TABLE;
     this.noiseLFSR = 0x4000;
     this.masterVolL = 0;
     this.masterVolR = 0;
@@ -704,10 +766,10 @@ class DSP {
     // --- エコー(残響) ---
     // 実機同様、エコーバッファはSPC RAM上(ESA/EDLで指定)に置く。
     // 8タップFIRの履歴と書き込み位置を保持する。
-    this.echoPos = 0;
-    this.echoLen = 0;
-    this.firHistL = new Float64Array(8);
-    this.firHistR = new Float64Array(8);
+    this.echoOffset = 0;
+    this.echoLength = 4;
+    this.firHistL = new Int32Array(8);
+    this.firHistR = new Int32Array(8);
     this.firPos = 0;
 
     // --- 出力段(耳に優しくするための後処理) ---
@@ -720,10 +782,10 @@ class DSP {
   reset() {
     this.regs.fill(0);
     this.regAddr = 0;
-    this._globalCounter = 0;
+    this._globalCounter = 0x77ff;
     this._pendingKon = 0; // このサンプル期間中にKONへ書き込まれたビットの蓄積
-    this.echoPos = 0;
-    this.echoLen = 0;
+    this.echoOffset = 0;
+    this.echoLength = 4;
     this.firHistL.fill(0); this.firHistR.fill(0); this.firPos = 0;
     this.dcPrevInL = this.dcPrevOutL = this.dcPrevInR = this.dcPrevOutR = 0;
     this.lpL = this.lpR = 0;
@@ -759,7 +821,7 @@ class DSP {
 
   volL(v) { return this._s8(this.regs[v * 0x10 + 0x00]); }
   volR(v) { return this._s8(this.regs[v * 0x10 + 0x01]); }
-  pitch(v) { return this.regs[v * 0x10 + 0x02] | (this.regs[v * 0x10 + 0x03] << 8); }
+  pitch(v) { return this.regs[v * 0x10 + 0x02] | ((this.regs[v * 0x10 + 0x03] & 0x3f) << 8); }
   srcn(v) { return this.regs[v * 0x10 + 0x04]; }
   adsr1(v) { return this.regs[v * 0x10 + 0x05]; }
   adsr2(v) { return this.regs[v * 0x10 + 0x06]; }
@@ -811,23 +873,24 @@ class DSP {
       if (range <= 12) {
         sample = (nibble << range) >> 1;
       } else {
+        // range 13-15 は不正値: 実機は符号だけを反映する
         sample = nibble < 0 ? -2048 : 0;
       }
 
-      let pred = 0;
       switch (filter) {
-        case 0: pred = 0; break;
-        case 1: pred = h1 + ((-h1) >> 4); break;
-        case 2: pred = h1 * 2 + ((-(h1 * 3)) >> 5) - h2 + (h2 >> 4); break;
-        case 3: pred = h1 * 2 + ((-(h1 * 13)) >> 6) - h2 + ((h2 * 3) >> 4); break;
+        case 1: sample += h1 + ((-h1) >> 4); break;
+        case 2: sample += h1 * 2 + ((-(h1 * 3)) >> 5) - h2 + (h2 >> 4); break;
+        case 3: sample += h1 * 2 + ((-(h1 * 13)) >> 6) - h2 + ((h2 * 3) >> 4); break;
       }
-      let s = sample + pred;
-      if (s > 32767) s = 32767;
-      if (s < -32768) s = -32768;
+      // 16bit にクランプし、その後 15bit へ折り返す(実機の挙動)。
+      // クランプだけだと大振幅で符号が反転すべき所が 32767 に張り付いてしまう。
+      if (sample > 32767) sample = 32767;
+      else if (sample < -32768) sample = -32768;
+      sample = (sample << 17) >> 17;
 
-      out[i] = s;
+      out[i] = sample;
       h2 = h1;
-      h1 = s;
+      h1 = sample;
     }
 
     voice.history[0] = h1;
@@ -840,14 +903,19 @@ class DSP {
     return endBit === 1;
   }
 
-  stepNoise() {
-    let lfsr = this.noiseLFSR;
-    const bit = ((lfsr << 14) ^ (lfsr << 13)) & 0x4000;
-    lfsr = ((lfsr >> 1) | bit) & 0x7fff;
-    this.noiseLFSR = lfsr;
-    let v = lfsr & 0x7fff;
-    if (v & 0x4000) v -= 0x8000;
-    return v;
+  // ノイズ発生器は全ボイス共通。FLG bit0-4 のレートで「1サンプルにつき高々1回」クロックされる。
+  clockNoise() {
+    const rate = this.flg & 0x1f;
+    if (this._rateFires(rate)) {
+      const lfsr = this.noiseLFSR;
+      const fb = (lfsr ^ (lfsr >> 1)) & 1;
+      this.noiseLFSR = ((lfsr >> 1) & 0x3fff) | (fb << 14);
+    }
+  }
+  // 現在のノイズ値(15bitを16bitに左詰めした符号付き値 = (int16)(lfsr<<1))を、
+  // ボイスの15bitサンプルスケールに合わせて返す。
+  noiseSample() {
+    return ((this.noiseLFSR << 17) >> 17);
   }
 
   stepEnvelope(voice, vIdx) {
@@ -878,16 +946,16 @@ class DSP {
         const rate = attackRate;
         if (this._rateFires(rate)) {
           voice.envLevel += (rate === 31) ? 1024 : 32;
-          if (voice.envLevel >= 2047) {
-            voice.envLevel = 2047;
-            voice.envMode = 'decay';
-          }
+          // 実機: 0x7E0 以上でディケイへ移行。エンベロープ自体は 0x7FF でクランプ。
+          if (voice.envLevel >= 0x7e0) voice.envMode = 'decay';
+          if (voice.envLevel > 0x7ff) voice.envLevel = 0x7ff;
         }
       } else if (voice.envMode === 'decay') {
         if (this._rateFires(decayRate)) {
           voice.envLevel -= (((voice.envLevel - 1) >> 8) + 1);
           if (voice.envLevel < 0) voice.envLevel = 0;
-          if (voice.envLevel <= sustainLvl) voice.envMode = 'sustain';
+          // 実機: (env >> 8) == SL で移行 → env が sustainLvl(=(SL+1)*256) 未満になったら。
+          if (voice.envLevel < sustainLvl) voice.envMode = 'sustain';
         }
       } else if (voice.envMode === 'sustain') {
         if (sustainRate > 0 && this._rateFires(sustainRate)) {
@@ -904,13 +972,13 @@ class DSP {
         const rate = gainVal & 0x1f;
         if (this._rateFires(rate)) {
           if (mode === 0) {
-            voice.envLevel -= 32;
+            voice.envLevel -= 32;                                   // 直線減少
           } else if (mode === 1) {
-            voice.envLevel += 32;
+            voice.envLevel -= (((voice.envLevel - 1) >> 8) + 1);    // 指数減少
           } else if (mode === 2) {
-            voice.envLevel -= (((voice.envLevel - 1) >> 8) + 1);
+            voice.envLevel += 32;                                   // 直線増加
           } else {
-            voice.envLevel += (voice.envLevel < 1536) ? 32 : 8;
+            voice.envLevel += (voice.envLevel < 0x600) ? 32 : 8;    // 折れ線増加
           }
           if (voice.envLevel < 0) voice.envLevel = 0;
           if (voice.envLevel > 2047) voice.envLevel = 2047;
@@ -923,15 +991,77 @@ class DSP {
     return voice.envLevel;
   }
 
+  // 実機: カウンタは 0x77FF から毎サンプル1ずつ減り、0 の次は 0x77FF に戻る。
+  // レート r は ((counter + offset[r]) % period[r]) === 0 のときに発火する。
   _rateFires(rateIndex) {
     const period = COUNTER_RATES[rateIndex] || 0;
     if (period === 0) return false;
-    this._globalCounter = (this._globalCounter || 0);
-    return (this._globalCounter % period) === 0;
+    return ((this._globalCounter + COUNTER_OFFSETS[rateIndex]) % period) === 0;
+  }
+
+  // エコー段。EON ボイスの合計(eMixL/R)を受け取り、FIR 出力 [L, R] を返す。
+  // 副作用として SPC RAM 上のエコーバッファを更新する(FLG bit5=1 のときは書かない)。
+  _echoStep(eMixL, eMixR) {
+    const ram = this.ram;
+    const base = ((this.esa << 8) + this.echoOffset) & 0xffff;
+
+    // (1) RAM から読む(16bit LE, 符号付き)。履歴は 15bit へ落とす(>>1)。
+    let inL = ram[base] | (ram[(base + 1) & 0xffff] << 8); inL = (inL << 16) >> 16;
+    let inR = ram[(base + 2) & 0xffff] | (ram[(base + 3) & 0xffff] << 8); inR = (inR << 16) >> 16;
+
+    const hl = this.firHistL, hr = this.firHistR, fp = this.firPos;
+    hl[fp] = inL >> 1; hr[fp] = inR >> 1;
+    this.firPos = (fp + 1) & 7;
+
+    // (2) FIR: t=0 が最古、t=7 が最新。実機は先頭7タップの合計を int16 で保持する
+    //     (=16bit にラップ)。最後のタップを足した後に 16bit クランプする。
+    let fl = 0, fr = 0;
+    for (let t = 0; t < 7; t++) {
+      const idx = (this.firPos + t) & 7;      // firPos は「次に書く位置」= 最古
+      const c = this.fir(t);
+      fl += (hl[idx] * c) >> 6;
+      fr += (hr[idx] * c) >> 6;
+    }
+    {
+      const idx = (this.firPos + 7) & 7;
+      const c = this.fir(7);
+      // 先頭7項の合計を int16 にラップ
+      fl = (fl << 16) >> 16; fr = (fr << 16) >> 16;
+      fl += (hl[idx] * c) >> 6;
+      fr += (hr[idx] * c) >> 6;
+    }
+    if (fl > 32767) fl = 32767; else if (fl < -32768) fl = -32768;
+    if (fr > 32767) fr = 32767; else if (fr < -32768) fr = -32768;
+    fl &= ~1; fr &= ~1;                       // 実機は最下位ビットを落とす
+
+    // (3) 書き戻し。FLG bit5(ECEN)=1 のときは書き込み禁止。
+    if (!(this.flg & 0x20)) {
+      let wl = eMixL + ((fl * this.efb) >> 7);
+      let wr = eMixR + ((fr * this.efb) >> 7);
+      if (wl > 32767) wl = 32767; else if (wl < -32768) wl = -32768;
+      if (wr > 32767) wr = 32767; else if (wr < -32768) wr = -32768;
+      wl &= ~1; wr &= ~1;
+      ram[base]                = wl & 0xff;
+      ram[(base + 1) & 0xffff] = (wl >> 8) & 0xff;
+      ram[(base + 2) & 0xffff] = wr & 0xff;
+      ram[(base + 3) & 0xffff] = (wr >> 8) & 0xff;
+    }
+
+    // バッファ位置を進める。長さに達したら 0 へ戻し、その時点の EDL を反映する。
+    this.echoOffset += 4;
+    if (this.echoOffset >= this.echoLength) {
+      this.echoOffset = 0;
+      this.echoLength = this.edl * 2048;
+      if (this.echoLength === 0) this.echoLength = 4;   // EDL=0 でも 1 組
+    }
+
+    return [fl, fr];
   }
 
   generateSample() {
-    this._globalCounter = (this._globalCounter || 0) + 1;
+    // カウンタは毎サンプル1減算(0 の次は 0x77FF)
+    this._globalCounter = (this._globalCounter === 0) ? 0x77ff : this._globalCounter - 1;
+    this.clockNoise();
 
     let mixL = 0, mixR = 0;
     let eMixL = 0, eMixR = 0; // EONが立っているボイスだけをエコーへ送る
@@ -940,6 +1070,7 @@ class DSP {
     // トリガーを取りこぼさないようにするため)。
     const konReg = this.kon | (this._pendingKon || 0);
     const koffReg = this.koff;
+    const resetFlag = (this.flg & 0x80) !== 0;   // FLG bit7: ソフトリセット
     this._pendingKon = 0;
 
     for (let i = 0; i < 8; i++) {
@@ -954,13 +1085,15 @@ class DSP {
       } else {
         voice._konLatched = false;
       }
-      if (koffReg & bit) {
-        voice.keyOff = true;
-      } else {
-        voice.keyOff = false;
+      // KOFF、または FLG bit7(RESET) でリリースへ。RESET 中はエンベロープも即 0。
+      voice.keyOff = ((koffReg & bit) !== 0) || resetFlag;
+      if (resetFlag) {
+        voice.envLevel = 0;
+        voice.envMode = 'off';
       }
 
       if (voice.envMode === 'off') {
+        voice.outSample = 0;   // PMON が次のボイスで参照するので、停止中は 0
         continue;
       }
 
@@ -982,42 +1115,50 @@ class DSP {
         continue;
       }
 
-      let p = this.pitch(i);
+      let p = this.pitch(i) & 0x3fff;
       if (i > 0 && (this.pmon & bit)) {
-        const prevOut = this.voices[i - 1].outSample;
-        p = Math.floor((p * ((prevOut >> 5) + 1024)) / 1024);
+        // 直前ボイスの出力(エンベロープ後・15bit値)。実機は factor = (out >> 4) + 0x400。
+        const prevOut = this.voices[i - 1].outSample | 0;
+        p = (p * ((prevOut >> 4) + 0x400)) >> 10;
       }
       if (p > 0x3fff) p = 0x3fff;
 
-      // --- ガウス補間 -------------------------------------------------
-      // 直近4サンプル(voice.interp: 古→新)と、ピッチカウンタ下位ビットから
-      // 表を引いて補間する。線形補間より高域の折り返しが少なく、丸い音になる。
+      // --- ガウス補間(実機式) ------------------------------------------------
+      // ピッチカウンタ bit4-11 で表を引き、直近4サンプル(ip: 古→新)を畳み込む。
+      // 最初の3項を足した時点で16bitにラップし、最後の項を足した後にクランプ、>>1。
       const gi = (voice.pitchCounter >> 4) & 0xff; // 0..255
       const gt = this.gaussTable;
       const ip = voice.interp;
-      let sample =
-        (gt[255 - gi] * ip[0] +
-         gt[511 - gi] * ip[1] +
-         gt[256 + gi] * ip[2] +
-         gt[gi]       * ip[3]) / 2048;
+      let gs = (gt[255 - gi] * ip[0]) >> 10;
+      gs += (gt[511 - gi] * ip[1]) >> 10;
+      gs += (gt[256 + gi] * ip[2]) >> 10;
+      gs = (gs << 16) >> 16;                        // 16bitラップ
+      gs += (gt[gi] * ip[3]) >> 10;
+      if (gs > 32767) gs = 32767; else if (gs < -32768) gs = -32768;
+      let sample = gs >> 1;                          // 15bit
 
       if (this.non & bit) {
-        sample = this.stepNoise();
+        sample = this.noiseSample();
       }
 
       const env = this.stepEnvelope(voice, i);
-      sample = (sample * env) / 2047;
+      // 実機: サンプル(15bit) × エンベロープ(11bit) >> 11
+      sample = (sample * env) >> 11;
 
       voice.outSample = sample;
 
-      const vl = this.volL(i) / 128;
-      const vr = this.volR(i) / 128;
-      mixL += sample * vl;
-      mixR += sample * vr;
+      // 音量(符号付き8bit): sample * vol >> 7。左右それぞれ 16bit にクランプしながら加算。
+      const vl = (sample * this.volL(i)) >> 7;
+      const vr = (sample * this.volR(i)) >> 7;
+      mixL += vl;
+      mixR += vr;
+      if (mixL > 32767) mixL = 32767; else if (mixL < -32768) mixL = -32768;
+      if (mixR > 32767) mixR = 32767; else if (mixR < -32768) mixR = -32768;
       if (this.eon & bit) {
-        // エコー送り(15bit相当へ揃える)
-        eMixL += sample * vl;
-        eMixR += sample * vr;
+        eMixL += vl;
+        eMixR += vr;
+        if (eMixL > 32767) eMixL = 32767; else if (eMixL < -32768) eMixL = -32768;
+        if (eMixR > 32767) eMixR = 32767; else if (eMixR < -32768) eMixR = -32768;
       }
 
       voice.pitchCounter += p;
@@ -1051,58 +1192,20 @@ class DSP {
     }
 //this.regs[0x4c] = 0;
     // ---- エコー(残響) --------------------------------------------------
-    // 実機と同じく、エコーバッファはSPC RAM上(ESA*0x100 から EDL*2KB)。
-    // FLGのbit5(ECEN)が立っていなければ書き込みしない(=RAMを壊さない)。
-    // 響きが加わることで音の角が取れ、空間になじんで耳に優しくなる。
-    const echoLen = this.edl * 512;             // 単位: ステレオ1組=4byte, 2KB=512組
-    const echoOn = echoLen > 0;
-    let echoOutL = 0, echoOutR = 0;
-    if (echoOn) {
-      const ram = this.ram;
-      const base = ((this.esa << 8) + this.echoPos * 4) & 0xffff;
-      // RAMからエコー入力(16bit LE)を読む
-      let inL = (ram[base] | (ram[(base + 1) & 0xffff] << 8)); if (inL & 0x8000) inL -= 0x10000;
-      let inR = (ram[(base + 2) & 0xffff] | (ram[(base + 3) & 0xffff] << 8)); if (inR & 0x8000) inR -= 0x10000;
-
-      // 8タップFIR。履歴は「古→新」のリング。
-      const hl = this.firHistL, hr = this.firHistR, fp = this.firPos;
-      hl[fp] = inL / 2; hr[fp] = inR / 2;      // 履歴は 15bit 相当に揃える
-      let fl = 0, fr = 0;
-      for (let t = 0; t < 8; t++) {
-        const idx = (fp + 1 + t) & 7;           // t=0が最古, t=7が最新
-        const c = this.fir(t);
-        fl += hl[idx] * c; fr += hr[idx] * c;
-      }
-      this.firPos = (fp + 1) & 7;
-      fl /= 64; fr /= 64;   // 履歴が入力/2(15bit)なので、実機どおり >>6 相当
-      if (fl > 32767) fl = 32767; else if (fl < -32768) fl = -32768;
-      if (fr > 32767) fr = 32767; else if (fr < -32768) fr = -32768;
-      echoOutL = fl; echoOutR = fr;
-
-      // フィードバックを書き戻す(FLG bit5 = 1 なら書き込み禁止)
-      if (!(this.flg & 0x20)) {
-        const efb = this.efb / 128;
-        // mixのEONビット分だけをエコーへ送る(下で eMixL/R に集計済み)
-        let wl = eMixL + fl * efb;
-        let wr = eMixR + fr * efb;
-        // ブロック内は 16bit 整数に丸めて格納
-        wl = Math.max(-32768, Math.min(32767, Math.round(wl)));
-        wr = Math.max(-32768, Math.min(32767, Math.round(wr)));
-        ram[base]                 = wl & 0xff;
-        ram[(base + 1) & 0xffff]  = (wl >> 8) & 0xff;
-        ram[(base + 2) & 0xffff]  = wr & 0xff;
-        ram[(base + 3) & 0xffff]  = (wr >> 8) & 0xff;
-      }
-      this.echoPos = (this.echoPos + 1) % (echoLen);
-    } else {
-      this.echoPos = 0;
-    }
+    const [echoOutL, echoOutR] = this._echoStep(eMixL, eMixR);
 
     // ---- ミックス --------------------------------------------------------
-    // ドライ(ボイス) + ウェット(エコー)。音量は実機の /128 スケール。
-    // mix/echoOut はどちらも 16bit 相当のスケール。音量レジスタは /128 が実機の定義。
-    let outL = (mixL * this.mvolL + echoOutL * this.evolL) / (128 * 8192 * OUTPUT_HEADROOM);
-    let outR = (mixR * this.mvolR + echoOutR * this.evolR) / (128 * 8192 * OUTPUT_HEADROOM);
+    // 実機: out = clamp16( (dry * MVOL >> 7) + (echo * EVOL >> 7) )。
+    // 最終値は 16bit(±32768)なので、/32768 で ±1.0 に正規化し、余裕(HEADROOM)で割る。
+    let dl = ((mixL * this.mvolL) >> 7) + ((echoOutL * this.evolL) >> 7);
+    let dr = ((mixR * this.mvolR) >> 7) + ((echoOutR * this.evolR) >> 7);
+    if (dl > 32767) dl = 32767; else if (dl < -32768) dl = -32768;
+    if (dr > 32767) dr = 32767; else if (dr < -32768) dr = -32768;
+    let outL = dl / (32768 * OUTPUT_HEADROOM);
+    let outR = dr / (32768 * OUTPUT_HEADROOM);
+
+    // FLG bit6(MUTE): 出力を無音化(内部状態は進め続ける)
+    if (this.flg & 0x40) { outL = 0; outR = 0; }
 
     // ---- 出力の後処理(耳に優しくする) ----------------------------------
     // 1) 穏やかなソフトクリップ: 歪ませずにピークだけ丸める
@@ -1156,36 +1259,78 @@ const CPU_CYCLES_PER_SAMPLE = 32;
 
 class SPCEngine {
   constructor() {
-    this.dsp = new DSP();
-    this.cpu = new SPC700(this.dsp);
-    this.dsp.ram = this.cpu.ram;
+    this.cpu = new SPC700(null);
+    this.dsp = new DSP(this.cpu.ram);
+    this.cpu.dsp = this.dsp;
     this.loaded = false;
     this._cycleAccum = 0;
   }
 
   loadSPC(parsed) {
-    this.cpu.ram.set(parsed.ram);
-    this.cpu.A = parsed.a;
-    this.cpu.X = parsed.x;
-    this.cpu.Y = parsed.y;
-    this.cpu.SP = parsed.sp;
-    this.cpu.PC = parsed.pc;
-    this.cpu.setPSW(parsed.psw);
+    const cpu = this.cpu, dsp = this.dsp;
 
-    this.dsp.reset();
-    this.dsp.regs.set(parsed.dspRegs);
+    // ---- CPU レジスタ / RAM ----
+    cpu.ram.set(parsed.ram);
+    cpu.A = parsed.a & 0xff;
+    cpu.X = parsed.x & 0xff;
+    cpu.Y = parsed.y & 0xff;
+    cpu.SP = parsed.sp & 0xff;
+    cpu.PC = parsed.pc & 0xffff;
+    cpu.setPSW(parsed.psw);
+    cpu.cycles = 0;
 
-    const ioRegs = [0xfa, 0xfb, 0xfc, 0xf1];
-    for (const addr of ioRegs) {
-      this.cpu.write(addr, parsed.ram[addr]);
+    // ---- I/O レジスタの復元 ----
+    // cpu.write() は「$F1 のポートクリア」などの副作用を起こすので使わず、状態を直接復元する。
+    const f1 = parsed.ram[0xf1];
+    cpu.romEnable = (f1 & 0x80) !== 0;              // ブートROMの可視/不可視
+    for (let t = 0; t < 3; t++) {
+      cpu.timerEnable[t] = (f1 >> t) & 1;
+      cpu.timerTarget[t] = parsed.ram[0xfa + t];    // 生の値(0 は 256 分周)
+      cpu.timerCounter[t] = 0;
+      cpu.timerOut[t] = 0;
+      cpu._tAccum[t] = 0;
     }
     for (let i = 0; i < 4; i++) {
-      this.cpu.ioIn[i] = parsed.ram[0xf4 + i];
-      this.cpu.ioOut[i] = parsed.ram[0xf4 + i];
+      cpu.ioIn[i] = parsed.ram[0xf4 + i];           // 65816 → SPC 方向の値
+      cpu.ioOut[i] = parsed.ram[0xf4 + i];          // SPC → 65816 方向の値
     }
-    this.cpu.timerCounter = [0, 0, 0];
-    this.cpu.timerOut = new Uint8Array(3);
-    this.cpu._tAccum = [0, 0, 0];
+    dsp.regAddr = parsed.ram[0xf2];                 // $F2 (DSPアドレス) も復元
+
+    // ---- DSP レジスタ ----
+    dsp.reset();
+    dsp.regs.set(parsed.dspRegs);
+    dsp.regs[0x7c] = parsed.dspRegs[0x7c];           // ENDX はそのまま保持
+
+    // ボイスの現在状態の復元:
+    //  * KON は「過去の書き込み値」であって新規のキーオンではないので、再トリガーしない。
+    //    (_konLatched を立てて、KON が一度 0 になるまで無視する)
+    //  * SPC ファイルにはボイスの内部位置が保存されていないので、
+    //    ENVX($x8) が非0 のボイスは「発音中」とみなして、envLevel を復元し
+    //    サスティン状態から続ける。KOFF が立っていればリリース。
+    const konSnapshot = parsed.dspRegs[0x4c];
+    for (let i = 0; i < 8; i++) {
+      const v = dsp.voices[i];
+      v._konLatched = ((konSnapshot >> i) & 1) === 1;
+      const envx = parsed.dspRegs[i * 0x10 + 0x08];
+      if (envx > 0) {
+        v.envLevel = Math.min(2047, envx << 4);
+        v.envMode = 'sustain';
+        // BRR の位置は不明なので、サンプルの先頭から続ける。
+        // 最初のブロックをここで明示的にデコードし、補間履歴を先頭サンプルで初期化する
+        // (デコードしないと decodedBlock が空のまま読まれて無音になる)。
+        const dirEntry = dsp.getSampleDirEntry(dsp.srcn(i));
+        v.brrAddr = dirEntry.start;
+        v.pitchCounter = 0;
+        v.history = [0, 0];
+        v.endFlag = false;
+        v.loopFlag = false;
+        dsp.decodeBrrBlock(v, v.brrAddr, i);
+        dsp.regs[0x7c] = parsed.dspRegs[0x7c];        // decode が ENDX を触るので元へ戻す
+        v.interp[0] = 0; v.interp[1] = 0; v.interp[2] = 0;
+        v.interp[3] = v.decodedBlock[0];
+        v.brrOffset = 1;
+      }
+    }
 
     this.loaded = true;
     this._cycleAccum = 0;
